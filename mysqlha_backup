@@ -1,0 +1,761 @@
+#!/usr/bin/python2.6
+#--1-- coding:utf-8 --!--
+from optparse import OptionParser
+import logging
+import logging.config
+import datetime
+import re
+import subprocess
+import shlex
+import datetime
+import time
+import os
+import shutil
+
+try:
+    import MySQLdb
+except ImportError:
+    os.popen('yum install -y MySQL-python')
+    import MySQLdb
+except Exception,e:
+    raise e
+    
+today =  datetime.date.today()
+ 
+
+
+class LogMsg(object):
+    import os
+    def __init__(self):
+        self._date = datetime.date.today().strftime('%Y%m%d')
+        self._port = None
+        self._name = None
+        self._path = '/export/data/mysql/log'
+    def get_log_file(self):
+        return os.path.join(self._path,self._name)
+    def log_msg(self,level = 'debug',messages = None):
+        self._name = 'mysql_backup_%s.log'%(self._port)
+        try:
+            file_format='%(asctime)s - %(levelname)s - %(message)s'
+            file_formatter = logging.Formatter(file_format)
+            info_logger = logging.getLogger()
+            info_logger.setLevel(logging.DEBUG)
+            info_handler = logging.FileHandler(self.get_log_file(), 'a')
+            info_handler.setLevel(logging.DEBUG)
+            info_handler.setFormatter(file_formatter)
+            ###screen        
+            screen_format='%(levelname)s - %(message)s'
+            screen_formatter = logging.Formatter(screen_format)
+            screen_handler = logging.StreamHandler()
+            screen_handler.setFormatter(screen_formatter)
+            screen_handler.setLevel(logging.INFO)
+            info_logger.addHandler(info_handler)
+            info_logger.addHandler(screen_handler)
+            if level == 'debug':
+                info_logger.debug(messages)
+            elif level == 'info':
+                info_logger.info(messages)
+            elif level == 'warn':
+                info_logger.warn(messages)
+            elif level == 'error':
+                info_logger.error(messages)
+            elif level == 'critical':
+                info_logger.critical(messages)
+            else:
+    	        info_logger.error('level is wrong,input is %s'%(level))
+            info_logger.removeHandler(screen_handler)
+        except Exception,e:
+            info_logger.critical(str(e))
+
+
+
+
+def exec_shell_cmd (shell_cmd=None,*args,**kwargs):
+    try:
+        import os
+        shell_cmd = '%s;echo $?'%(shell_cmd)
+        #print shell_cmd
+        cmd_result=os.popen(shell_cmd).read()
+        result = {}
+        if re.findall(r'0$',cmd_result):
+            result['status']=1
+            result['info']=cmd_result[0:-3]
+        else:
+            result['status']=0
+            result['info']=cmd_result[0:-3]
+    except Exception,e:
+        result['status'] = 0 
+        l.log_msg('error','exec_shell_cmd:%s'%(e))
+        raise
+    finally:
+        return result
+
+
+
+
+class MySQLInstance(object):
+    def __init__(self):
+        self._host = None
+        self._port = None
+        self._user = None 
+        self._password = None
+        self._db = None
+        self._cur = None
+        self.is_connected = False
+    def _connect_able(self):
+        try:
+            self._conn = MySQLdb.connect(host=self._host,user=self._user,passwd=self._password,port=self._port,charset="utf8",connect_timeout=1,db=self._db)
+            self._cur = self._conn.cursor(cursorclass=MySQLdb.cursors.DictCursor)
+            self.is_connected = True
+        except MySQLError,e:
+            self.is_connected = False
+            l.log_msg('error','%s'%(e))
+        except Exception,e:
+            raise e
+        finally:
+            if self.is_connected:
+                l.log_msg('info','''connect to %s:%s sucess!'''%(self._host,self._port))
+            else:
+                l.log_msg('error','''connect to %s:%s failed!'''%(self._host,self._port))
+            return self.is_connected
+    
+    def _exec_sql(self, sql):
+        self._cur.execute(sql)
+        #self._conn.commit()
+        result_dic = self._cur.fetchall()
+        return result_dic
+
+
+
+class PostgeSQLInstance(object):
+    def __init__(self):
+        import psycopg2
+        import psycopg2.extras
+        self._host = None
+        self._port = None
+        self._user = None 
+        self._password = None
+        self._db = None
+        self._cur = None
+        self.is_connected = False
+    def _connect_able(self):
+        try:
+            import psycopg2
+            self._conn = psycopg2.connect(host=self._host,user=self._user,password=self._password,port=self._port,database=self._db)
+            self._cur = self._conn.cursor()
+            self.is_connected = True
+        except Exception,e:
+            raise e
+            self.is_connected = False
+        finally:
+            if self.is_connected:
+                l.log_msg('info','''connect to %s:%s sucess!'''%(self._host,self._port))
+            else:
+                l.log_msg('error','''connect to %s:%s failed!'''%(self._host,self._port))
+            return self.is_connected
+    def _exec_sql(self, sql):
+        rows=[]
+        try:
+            self._cur.execute(sql)
+            rows=self._cur.fetchall()
+            self._conn.commit()
+        except Exception,e:
+            raise e
+        finally:
+            return rows
+        
+        
+class backup_center_db(PostgeSQLInstance):
+    def __init__(self):
+	self._host = '172.17.33.166'
+	self._port = 6434
+	self._user = 'postgres' 
+	self._password = 'xxxxxxxxxxxxxxx' 
+	self._db = 'jdb_backup' 
+	self.is_connected = False
+
+
+            
+class JDBMySQL(MySQLInstance):
+    def __init__(self):
+        self._host = 'orajdb.mysql.jddb.com'
+        self._port = 3358
+        self._user = 'jdd_ops' 
+        self._password = '7ivKUFqSBGwI2o8M' 
+        self._db = 'jdd_ops' 
+        self.is_connected = False
+
+            
+
+class BackupMySQL(MySQLInstance):
+    def __init__(self,port):
+        import datetime
+        self._host = '127.0.0.1'
+        self._outer_ip = None
+        self._port = port
+        self._user = 'root' 
+        self._password = 'xxxxxxxxxxxxxxx' 
+        self._db = 'mysql' 
+        self._date = datetime.datetime.now().strftime("%Y%m%d")
+        self._datetime = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+        self._backup_path=''
+        self._backup_dir=''
+        self._backup_abs_path=''
+        self.is_connected = False
+        self.role=None
+	self._backup_user='root'
+        self._backup_pass='xxxxxxxxxxxxxxx'
+        global backup_mysql_port
+        backup_mysql_port = port
+        #datadir_path=''
+        #get_datadir_sql='''show variables like "datadir"'''
+        #datadir_path_result=self._exec_sql(get_datadir_sql)
+        #datadir_path=datadir_path_result[0].get('Value','')
+        #self.local_backup_dir_name = 'mysql_%s_%s'%(self.get_cluster_id(),method,self._date)
+        #self._backup_path=os.path.join(datadir_path, '..', 'dumps',self.local_backup_dir_name)
+        #self.remote_path=os.path.join('mnt',self._date)
+        #self.remote_path_and_file_name=os.path.join(self._date,self.local_backup_dir_name)
+    def get_mysql_role(self):
+        try:
+           get_slave_status_sql='''show slave status'''
+           slave_status=self._exec_sql(get_slave_status_sql)
+           get_binlogdump_thread_sql='''select count(*) slave_num from
+           information_schema.processlist where command="Binlog Dump"'''
+           binlog_dump_thread_status=self._exec_sql(get_binlogdump_thread_sql)
+           if len(slave_status) > 0:
+               io_thread_status = slave_status[0].get('Slave_IO_Running','')
+               sql_thread_status = slave_status[0].get('Slave_SQL_Running','')
+           else:
+               io_thread_status=''
+               sql_thread_status=''
+           if len(binlog_dump_thread_status) > 0:
+               binlog_dump_threads = binlog_dump_thread_status[0].get('slave_num',0)
+           else:
+               binlog_dump_threads = 0
+           if len(slave_status) == 0 or slave_status[0].get('Master_Host') == '1.1.1.1':
+               self.role='M'
+           else:
+               self.role='S'
+        except Exception,e:
+            l.log_msg('error','%s'%(e))
+            raise
+        finally:
+            return self.role
+
+    def set_path_and_file(self):
+        try:
+            datadir_path=''
+            get_datadir_sql='''show variables like "datadir"'''
+            datadir_path_result=self._exec_sql(get_datadir_sql)
+            datadir_path=datadir_path_result[0].get('Value','')
+            self.local_backup_dir_name = 'mysql_%s_%s_%s'%(self.get_cluster_id(),my_method,self._datetime)
+            self.local_backup_base_path=os.path.join(datadir_path, '..', 'dumps')
+            self.local_backup_path=os.path.join(self.local_backup_base_path,self.local_backup_dir_name)
+            self.remote_path_and_file_name=os.path.join(self._date,self.local_backup_dir_name)
+        except Exception,e:
+            raise e
+
+    def get_socket_path(self):
+        try:
+            socket_path=''
+            get_socket_path_sql='''show variables like "socket"'''
+            socket_path_result=self._exec_sql(get_socket_path_sql)
+            socket_path=socket_path_result[0].get('Value','')
+        except expception,e:
+            raise
+        finally:
+            return socket_path
+
+
+    def get_disk_info(self):
+        try:
+            disk_size_info = {}
+            datadir_path = self.get_datadir_path()
+            disk_info = os.statvfs(datadir_path)  
+            disk_size_info['available'] = disk_info.f_bsize*disk_info.f_bavail/1024  
+            disk_size_info['capacity'] = disk_info.f_bsize*disk_info.f_blocks/1024
+            disk_size_info['used'] = disk_info.f_bsize * disk_info.f_bfree/1024
+        except expception,e:
+            raise
+        finally:
+            return disk_size_info
+
+    def get_db_file_size(self):
+        try:
+            db_file_size = 0
+            get_db_file_size_cmd="""du -s %s|awk -F' ' '{print $1}'"""%(self.get_datadir_path())
+            db_file_size_result=exec_shell_cmd(get_db_file_size_cmd)
+            if db_file_size_result.get('status',0)==1:
+                db_file_size=int(db_file_size_result.get('info',0))
+        except expception,e:
+            raise
+        finally:
+            return db_file_size
+    def check_backup_path(self):
+        try:
+            backup_dir_status=0
+	    if os.path.exists(self._backup_dir):
+		backup_dir_status=1
+            else:
+                os.mkdir(self._backup_dir)
+		backup_dir_status=1
+        except expception,e:
+            raise
+        finally:
+            return backup_dir_status
+    def get_instance_status(self,role=None):
+        try:
+            instance_status={}
+            if role== 'master':
+                is_master=True
+            else:
+                is_master=False
+            if not is_master:
+                slave_status = self._exec_sql('show slave status')
+                if len(slave_status)>=1:
+		    if slave_status[0].get('Slave_IO_Running') == 'Yes':
+                        self._exec_sql('stop slave io_thread')
+                        self._exec_sql('start slave io_thread')
+                else:
+                    l.log_msg('error','''instance is not slave''')
+                slave_status = self._exec_sql('show slave status')
+                instance_status['second_behind_master']=slave_status[0].get('Seconds_Behind_Master')
+        except Exception,e:
+            raise
+        finally:
+            return instance_status
+    def get_cluster_id(self):
+        try:
+            import socket
+            host=self._outer_ip
+            port=self._port
+            get_instance_master_sql = '''show slave status'''
+            slave_status_list = self._exec_sql(get_instance_master_sql)
+            if not slave_status_list :
+                slave_status_list=[]
+            if len(slave_status_list) > 0 and slave_status_list[0].get('Master_Host')<>'1.1.1.1':
+                master_host = slave_status_list[0].get('Master_Host')
+                master_port = slave_status_list[0].get('Master_Port')
+            else:
+                master_host = None
+                master_port = None
+            get_instance_cluster_id_sql = '''select cluster_id from jd_cluster_details where mysql_ip="%s" and mysql_port = %s'''%(host,port)
+            cluster_id_list = ops_db._exec_sql(get_instance_cluster_id_sql)
+            if len(cluster_id_list) > 0:
+                cluster_id = '%04d'%(cluster_id_list[0].get('cluster_id'))
+            else:
+                cluster_id = None
+            if not cluster_id:
+                get_master_cluster_id_sql = '''select cluster_id from jd_cluster_details where mysql_ip="%s" and mysql_port = %s'''%(master_host,master_port)
+                master_cluster_id_list = ops_db._exec_sql(get_master_cluster_id_sql)
+                if len(master_cluster_id_list) > 0:
+                    cluster_id = '%04d'%(master_cluster_id_list[0].get('cluster_id'))
+                else:
+                    cluster_id = None
+            if not cluster_id:
+                raise 'get cluster_id failed'
+        except Exception, e:
+            raise e
+        finally:
+            return cluster_id
+    #####################################################
+    def xtra_backup(self):
+        try:
+            cnf_path='''/export/servers/mysql/etc/my.cnf'''
+            socket_path=self.get_socket_path()
+            xtrabackup_seccuss=False
+            xtra_configs='''--defaults-file=%s --slave-info --no-timestamp \
+                             --parallel=5 --throttle=5 --socket=%s \
+                             --user=%s --password=%s %s/data'''%(cnf_path,socket_path,self._backup_user,self._backup_pass,self.local_backup_path)
+            xtra_backup_cmd='''innobackupex %s &>>%s'''%(xtra_configs,l.get_log_file())
+            remove_backup_path_cmd='''/bin/rm -rf %s'''%(self.local_backup_path)
+            exec_shell_cmd(remove_backup_path_cmd)
+            xtrabackup_result=exec_shell_cmd(xtra_backup_cmd)
+            if xtrabackup_result.get('status',0) == 1:
+                xtrabackup_seccuss=True
+            else:
+                xtrabackup_seccuss=False
+        except Exception,e:
+            raise e
+        finally:
+            return xtrabackup_seccuss
+    def get_backup_path(self):
+        try:
+            get_datadir_sql='''show variables like "datadir"'''
+            datadir_path_result=self._exec_sql(get_datadir_sql)
+            datadir_path=datadir_path_result[0].get('Value','')
+            self._backup_path=os.path.join(datadir_path, '..', 'dumps')
+        except Exception,e:
+            raise e
+        finally:
+            return self._backup_path
+    def get_old_backup_file_list(self):
+        try:
+            import os
+            old_backup_file_list = []
+            for i in os.listdir(self._backup_path):
+                old_backup_file_list.append(os.path.join(self._backup_path,i))
+        except Exception,e:
+            raise e
+        finally:
+            return old_backup_file_list
+    
+    def xtra_apply_log(self):
+        try:
+            xtra_apply_seccuss=False
+            xtra_apply_configs='''--defaults-file=%s/data/backup-my.cnf --apply-log --use-memory 1G %s/data'''%(self._backup_abs_path,self.local_backup_path)
+            xtra_apply_cmd='''innobackupex %s &>>%s'''%(xtra_apply_configs,l.get_log_file())
+            xtra_apply_result=exec_shell_cmd(xtra_apply_cmd)
+            if xtra_apply_result.get('status',0) == 1:
+                xtra_apply_seccuss=True
+            else:
+                xtra_apply_seccuss=False
+        except Exception,e:
+            raise e
+        finally:
+            return xtra_apply_seccuss
+    def dump_backup(self):
+        try:
+            dump_success=False
+            dump_path='''/export/servers/mysql/bin/mysqldump'''
+            dump_opts='''--all-databases --all-tablespaces  --add-drop-trigger --add-drop-database --add-drop-table --allow-keywords --single-transaction --master-data --disable-keys --flush-privileges --include-master-host-port --tz-utc --include-master-host-port --master-data=2'''
+            if self.get_mysql_role() == 'S':
+                dump_opts = '''%s %s'''%(dump_opts,'--dump-slave=2')
+            exec_shell_cmd('''rm -rf %s'''%(self.local_backup_path))
+            mk_backup_dir_cmd='''mkdir -p %s'''%(self.local_backup_path)
+            mk_backup_dir_result=exec_shell_cmd(mk_backup_dir_cmd)
+            if mk_backup_dir_result.get('status',0)==1:
+                dump_cmd='''%s -h127.0.0.1 -P%s -u%s -p%s %s > %s/mysql_dump.sql'''%(dump_path,\
+											   self._port,\
+											   self._backup_user,\
+											   self._backup_pass,\
+                                                                                           dump_opts,\
+                                                                                           self.local_backup_path)
+                dump_result=exec_shell_cmd(dump_cmd)
+            else:
+                dump_result={}
+            if dump_result.get('status',0) == 1:
+                dump_success=True
+            else:
+                dump_success=False
+        except Exception,e:
+            raise e
+        finally:
+            return dump_success
+    def backup_mysql_server(self):
+        try:
+            backup_server_seccuss=False
+            backup_server_cmd='''cp -r /export/servers/mysql %s'''%(self.local_backup_path)
+            backup_server_result=exec_shell_cmd(backup_server_cmd)
+            if backup_server_result.get('status',0) == 1:
+                backup_server_seccuss=True
+            else:
+                backup_server_seccuss=False
+        except Exception,e:
+            raise e
+        finally:
+            return backup_server_seccuss
+    def backup_checksum(self):
+        try:
+            checksum_seccuss=False
+            checksum_cmd='''cd %s;find ./ -type f -print0|xargs -0 md5sum > checksum.md5 &>>%s'''%(self.local_backup_path,l.get_log_file())
+            checksum_result=exec_shell_cmd(checksum_cmd)
+            if checksum_result.get('status',0) == 1:
+                checksum_seccuss=True
+            else:
+                checksum_seccuss=False
+        except Exception,e:
+            raise e
+        finally:
+            return checksum_seccuss
+    def upload_to_ftp(self):
+        try:
+            upload_seccuss=False
+            mount_seccuss=False
+            ftp_addr='172.20.140.95'
+            ftp_user='mysql_backup'
+            ftp_pass='mysql123456'
+            ftp_dir_path=''
+            set_backup_info_sql='''update jdd_ops.jd_db_backup_detail set store_ip=inet_aton("%s") where id=%s'''%(ftp_addr,backup_id) 
+            ops_db._exec_sql(set_backup_info_sql)
+            ops_db._exec_sql("commit")
+            mount_dir='/mnt/%s'%(m.get_cluster_id())
+            exec_shell_cmd('''mkdir -p %s'''%(mount_dir))
+            check_curlftpfs_cmd = '''rpm -qa|grep "curlftpfs-"'''
+            curlftpfs_check_result = exec_shell_cmd(check_curlftpfs_cmd)
+            tar_result = {}
+            if curlftpfs_check_result.get('status') == 1:
+                if curlftpfs_check_result.get('info'):
+                    check_mount_cmd = '''mount -l|grep '%s'|wc -l'''%(mount_dir)
+                    check_mount_result = exec_shell_cmd(check_mount_cmd)
+                    if check_mount_result.get('status') == 1 and check_mount_result.get('info') == '1':
+                        exec_shell_cmd('fusermount -u %s'%(mount_dir))
+                    mount_cmd='''curlftpfs -o codepage=utf8 ftp://%s:%s@%s/data_backup/mysql_backup_dir %s'''%(ftp_user,ftp_pass,ftp_addr,mount_dir)
+                    tar_cmd='''mkdir -p %s/%s;cd %s;tar -czvf %s/%s.tar.gz .'''%(mount_dir,self._date,self.local_backup_path,mount_dir,self.remote_path_and_file_name)
+                    mount_result=exec_shell_cmd(mount_cmd)
+                    if mount_result.get('status') == 1:
+                        tar_result=exec_shell_cmd(tar_cmd)
+                        if tar_result.get('status') == 1:
+                            pass
+                        else:
+                            raise 'tar backup file failed'
+                    else:
+                        raise 'mount ftp failed'
+                    time.sleep(3)
+                    exec_shell_cmd('fusermount -u %s'%(mount_dir))
+                else:
+                    l.log_msg('error','''curlftpfs not installed''')
+            else:
+                l.log_msg('error','''check curlftpfs install failed''')
+            if tar_result.get('status',0) == 1:
+                upload_seccuss=True
+            else:
+                upload_seccuss=False
+        except Exception,e:
+            raise e
+        finally:
+            return upload_seccuss
+
+class MySQLHost(object):
+    def __init__(self):
+        try:
+            import os
+            self.path = '/export'
+            disk_info = os.statvfs(self.path)
+            self.total = disk_info.f_frsize * disk_info.f_blocks
+            self.free = disk_info.f_frsize * disk_info.f_bavail
+            self.used = disk_info.f_frsize * (disk_info.f_blocks - disk_info.f_bfree)
+            self.xtra_rpm_installed = 0
+        except Exception,e:
+            l.log_msg('error','%s'%(e))
+            raise
+            
+
+    def get_freesize(self):
+        return self.free
+
+    def xtra_installed(self):
+        try:
+            import re
+            xtra_check_result = exec_shell_cmd('rpm -qa|egrep\
+            "percona-xtrabackup-"') 
+            if xtra_check_result.get('status') == 1:
+                if    re.findall(r'percona-xtrabackup',xtra_check_result.get('info')):
+                   self.xtra_rpm_installed = 1
+                else:
+                   self.xtra_rpm_installed = 0
+        except Exception,e:
+            self.xtra_rpm_installed = 0
+            l.log_msg('error','%s'%(e))        
+            raise
+        finally:
+            return self.xtra_rpm_installed 
+
+if __name__ == "__main__":
+    try:
+        from optparse import OptionParser
+        backup_status=1
+        opt=OptionParser()
+        opt.add_option('-P','--port',\
+        dest = 'port',\
+        type = int,\
+        help = 'port of mysql to be backup,default is 3358')
+        opt.add_option('-m','--method',\
+        dest = 'method',\
+        type = str,\
+        help = 'method of mysql tobe backup(xtra or dump),default is xtra')
+        opt.add_option('-r','--role',\
+        dest = "role",\
+        type = str,\
+        help = "role of mysql tobe backup,can be master or slave,default is slave")
+        (options,args) = opt.parse_args()
+        my_port = options.port
+        my_method = options.method
+        my_role = options.role
+        if not my_port:
+            my_port=3358
+        if not my_method:
+            my_method='xtra'
+            backup_status=1
+        elif my_method == 'dump' or my_method == 'xtra':
+            backup_status=1
+        else:
+            backup_status=0
+            print '''method must be dump/xtra'''
+        if not my_role:
+            my_role='slave'
+        my_role='master'
+        l=LogMsg()
+        l._port=my_port
+        h=MySQLHost()
+        ops_db=JDBMySQL()
+        b_c=backup_center_db()
+        m=BackupMySQL(my_port)
+        if backup_status == 1:
+            if ops_db._connect_able():
+                backup_status=1
+                get_host_info_sql='''select host from information_schema.processlist where id=connection_id()'''
+                host_info=ops_db._exec_sql(get_host_info_sql)
+                if len(host_info)>0:
+                    host_ip=host_info[0].get('host','').split(':')[0]
+                    m._outer_ip = host_ip
+                    backup_status=1
+                else:
+                    backup_status=0
+            	    l.log_msg('error','''get cluster_id failed''')
+  
+            else:
+                backup_status=0
+                l.log_msg('error','''can not connect to backup system db''')
+            if m._connect_able():
+                cluster_id=m.get_cluster_id()
+            else:
+                backup_status=0
+                l.log_msg('error','''get cluster_id failed''')
+            if backup_status==1:
+                is_backuping=True
+                while is_backuping:
+                    ops_db._exec_sql("commit")
+                    get_latest_backup_status_sql='''select backup_status from jdd_ops.jd_db_backup_detail where db_ip=inet_aton("%s") and cluster_id=%s order by id desc limit 1'''%(host_ip,cluster_id)
+                    latest_backup_status_result=ops_db._exec_sql(get_latest_backup_status_sql)
+                    if len(latest_backup_status_result)>=1:
+                        latest_backup_status=latest_backup_status_result[0].get('backup_status','success')
+                    else:
+                        latest_backup_status='success'
+                    is_backuping=True
+                    if latest_backup_status == 'backuping':
+                        l.log_msg('warn','''latest backup is running......''')
+                        time.sleep(10)
+                    else:
+                        is_backuping=False
+                        get_continue_fail_counts_sql = '''select (case when backup_status='failed' then continue_fail_counts+1 else 1 end) fail_counts from jd_db_backup_detail where cluster_id=%s order by backup_start_time limit 1'''%(cluster_id)
+                        continue_fail_counts_result = ops_db._exec_sql(get_continue_fail_counts_sql)
+                        if len(continue_fail_counts_result) > 0:
+                            fail_counts = continue_fail_counts_result[0].get('fail_counts',0)
+                        else:
+                            fail_counts = 0
+                           
+                        m.set_path_and_file()
+                        start_backup_sql='''insert into jdd_ops.jd_db_backup_detail(cluster_id,db_ip,db_port,db_backup_method,db_type,backup_start_time,backup_status,backup_file_name,continue_fail_counts) values(%s,inet_aton("%s"),%s,"%s","%s",now(),"backuping","%s.tar.gz",%s)'''%(cluster_id,host_ip,my_port,my_method,'mysql',m.remote_path_and_file_name,fail_counts)
+                        ops_db._exec_sql(start_backup_sql)
+                        get_backup_id_sql='''select last_insert_id()'''
+                        backup_result=ops_db._exec_sql(get_backup_id_sql)
+                        ops_db._exec_sql("commit")
+                        if len(backup_result)>0:
+                            backup_id=backup_result[0].get('last_insert_id()',0)
+                        else:
+                            backup_status=0
+                            l.log_msg('warn','''set info to backup system db failed''')
+        if backup_status==1:
+            if my_role=='slave':
+                second_behind_master_info=m.get_instance_status()
+                second_behind_master=second_behind_master_info.get('second_behind_master',-9999)
+                if second_behind_master >= 0:
+                    instance_is_ok=True
+                else:
+                    instance_is_ok=False
+                    l.log_msg('error','''slave status is wrong''')
+            else:
+                    instance_is_ok=True
+            if instance_is_ok:
+                import os
+                old_backup_file_list = os.listdir(m.local_backup_base_path)
+                if m.get_disk_info().get('available',0)*0.8 >= m.get_db_file_size():
+                    old_backup_file_list = m.get_old_backup_file_list()
+                    backup_file_size=m.get_db_file_size()
+                    if my_method=='xtra': 
+                        if m.xtra_backup():
+                            l.log_msg('info','''xtra_backup backup success''')
+                            set_backup_info_sql='''update jdd_ops.jd_db_backup_detail set info="xtra backup success" where id=%s'''%(backup_id) 
+                            if m.xtra_apply_log():
+                                l.log_msg('info','''xtra_backup apply success''')
+                                set_backup_info_sql='''update jdd_ops.jd_db_backup_detail set info="xtra apply success" where id=%s'''%(backup_id) 
+                            else:
+                                set_backup_info_sql='''update jdd_ops.jd_db_backup_detail set info="xtra apply error",backup_status="failed" where id=%s'''%(backup_id) 
+                                backup_status=0
+                                l.log_msg('error','''xtra_backup apply failed''')
+                        else:
+                            set_backup_info_sql='''update jdd_ops.jd_db_backup_detail set info="xtra backup error",backup_status="failed" where id=%s'''%(backup_id) 
+                            l.log_msg('error','''xtra_backup backup failed''')
+                            backup_status=0
+                    elif my_method=='dump':
+                        if m.dump_backup():
+                            l.log_msg('info','''mysqldump backup success''')
+                            set_backup_info_sql='''update jdd_ops.jd_db_backup_detail set info="dump backup success" where id=%s'''%(backup_id) 
+                        else:
+                            set_backup_info_sql='''update jdd_ops.jd_db_backup_detail set info="dump backup error",backup_status="failed" where id=%s'''%(backup_id) 
+                            l.log_msg('error','''mysqldump backup failed''')
+                            backup_status=0
+                    ops_db._exec_sql(set_backup_info_sql)
+                    ops_db._exec_sql("commit")
+                    if backup_status==1:
+                        if m.backup_mysql_server():
+                            get_backup_file_size_cmd = '''du --max-depth=0 %s|cut -f1'''%(m.local_backup_path)
+                            backup_file_size_result = exec_shell_cmd(get_backup_file_size_cmd)
+                            if backup_file_size_result.get('status') == 1:
+                                backup_file_size = backup_file_size_result.get('info')
+                            else:
+                                backup_file_size = 0 
+                            set_backup_info_sql='''update jdd_ops.jd_db_backup_detail set info="mysql software backup success",backup_file_size="%s" where id=%s'''%(backup_id,backup_file_size) 
+                            l.log_msg('info','''mysql software backup success''')
+                            
+                            backup_status=1
+                        else:
+                            set_backup_info_sql='''update jdd_ops.jd_db_backup_detail set info="mysql software backup failed",backup_status="failed" where id=%s'''%(backup_id) 
+                            l.log_msg('error','''mysql software backup failed''')
+                            backup_status=0
+                    else:
+                        set_backup_info_sql='''update jdd_ops.jd_db_backup_detail set backup_status="failed" where id=%s'''%(backup_id) 
+                        backup_status=0
+                    ops_db._exec_sql(set_backup_info_sql)
+                    ops_db._exec_sql("commit")
+                    if backup_status==1:
+                        if m.backup_checksum():
+                            set_backup_info_sql='''update jdd_ops.jd_db_backup_detail set info="checksum success" where id=%s'''%(backup_id) 
+                            l.log_msg('info','''mysql checksum success''')
+                            backup_status=1
+                        else:
+                            set_backup_info_sql='''update jdd_ops.jd_db_backup_detail set info="checksum failed",backup_status="failed" where id=%s'''%(backup_id) 
+                            l.log_msg('error','''mysql checksum failed''')
+                            backup_status=0
+                    else:
+                        set_backup_info_sql='''update jdd_ops.jd_db_backup_detail set backup_status="failed" where id=%s'''%(backup_id) 
+                        backup_status=0
+                    ops_db._exec_sql(set_backup_info_sql)
+                    ops_db._exec_sql("commit")
+                    if backup_status==1:
+                        for f in old_backup_file_list:
+                            if f not in ['/','/export','']:
+                                exec_shell_cmd('/bin/rm -rf %s'%(f))
+                        if m.upload_to_ftp():
+                            set_backup_info_sql='''update jdd_ops.jd_db_backup_detail set info="upload success",backup_status="success",backup_end_time=now(),backup_file_size=%s,continue_fail_counts=0 where id=%s'''%(backup_file_size,backup_id) 
+                            l.log_msg('info','''mysql upload success''')
+                            backup_status=1
+                        else:
+                            set_backup_info_sql='''update jdd_ops.jd_db_backup_detail set info="upload failed",backup_status="failed",backup_end_time=now() where id=%s'''%(backup_id) 
+                            l.log_msg('error','''mysql upload failed''')
+                            backup_status=0
+                    ops_db._exec_sql(set_backup_info_sql)
+                    ops_db._exec_sql("commit")
+                else:
+                    l.log_msg('error','''disk free size is not enough,require %s,only %s left'''%(m.get_db_file_size()*1.25,m.get_disk_info().get('available',0)))
+                    set_backup_info_sql='''update jdd_ops.jd_db_backup_detail set info="disk is not enough" where id=%s'''%(backup_id) 
+                    ops_db._exec_sql(set_backup_info_sql)
+                    ops_db._exec_sql("commit")
+            else:
+                set_backup_info_sql='''update jdd_ops.jd_db_backup_detail set info="instance status error" where id=%s'''%(backup_id) 
+                ops_db._exec_sql(set_backup_info_sql)
+                ops_db._exec_sql("commit")
+        #print b_c._connect_able()
+        #print b_c._exec_sql('select * from backup_daily_log')
+        #print m._exec_sql('select "abc"')
+        #print m.get_datadir_path()
+        #print m.get_instance_status()
+        #print m.check_backup_path()
+        #print m.get_socket_path()
+        #print m._exec_sql('select 1')
+        #print m.get_mysql_role()
+        #print h.xtra_installed()
+    except Exception,e:
+        raise e
+
