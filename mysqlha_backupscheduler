@@ -17,7 +17,7 @@ from tornado.options import define, options
 mysql_host='orajdb.mysql.jddb.com'
 mysql_port=3358
 mysql_user='jd_mha_manager'
-mysql_pass='CmNuduFFYHLEw1P2'
+mysql_pass='xxxxxxxxxxxxxxx'
 mysql_db='jdd_ops'
 def gen_inventory(host = None):
     try:
@@ -108,7 +108,7 @@ def get_backup_report():
         backuping_result_dic = ops_obj._exec_sql(get_backuping_sql)
         if len(backuping_result_dic) > 0:
             backup_summary_dic['backuping_list'] = backuping_result_dic
-        get_not_in_policy_sql = '''SELECT g.group_name project_name,c.cluster_name,c.cluster_id,u.username dba,p.backup_status from jd_db_backup_policy p right join jd_clusters c on c.cluster_id=p.cluster_id and p.backup_status<>'running' and trigger_type in('interval','cron') join jd_group g on c.group_id=g.group_id join auth_user u on g.db_admin=u.id order by u.username,project_name,c.cluster_name'''
+        get_not_in_policy_sql = '''SELECT g.group_name project_name,c.cluster_name,c.cluster_id,u.username dba,p.backup_status from jd_db_backup_policy p right join jd_clusters c on c.cluster_id=p.cluster_id and p.backup_status<>'running' and trigger_type in('interval','cron') join jd_group g on c.group_id=g.group_id join auth_user u on g.db_admin=u.id and c.cluster_id not in (select cluster_id from jd_db_backup_blacklist) order by u.username,project_name,c.cluster_name'''
         not_in_policy_result_dic = ops_obj._exec_sql(get_not_in_policy_sql)
         if len(not_in_policy_result_dic) > 0:
             backup_summary_dic['not_in_policy'] = not_in_policy_result_dic
