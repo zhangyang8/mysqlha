@@ -1,0 +1,124 @@
+#!/usr/bin/python2.6
+# -*- coding: utf-8 -*-
+from tornado.ioloop import IOLoop
+#from pytz import utc 
+import tornado.httpserver
+import tornado.ioloop
+import tornado.options
+import tornado.web
+from tornado.options import define, options
+import os
+import re
+import logging
+from Crypto.Cipher import AES
+import base64
+ 
+define("port", default=8000, help="run on the given port", type=int)
+class prpcrypt():
+    def __init__(self, key):
+        self.key = key
+        self.mode = AES.MODE_ECB
+
+    #解密后，去掉补足的空格用strip() 去掉
+    def decrypt(self, text):
+        cryptor = AES.new(self.key, self.mode, self.key)
+        plain_text = cryptor.decrypt(base64.decodestring(text))
+        text = plain_text.rstrip('\0')
+        padding = ord(text[len(text)-1])
+        source = text[0:(len(text)-padding)]
+        return source
+
+def jmms_exec_sql(sql=None):
+    try:
+        import MySQLdb
+        _host = 'my11991m.mysql.jddb.com'
+        _port = 3358
+        _user = 'mha_ro'
+        _password = 'XXXXXXXXX'
+        _db = 'jmms'
+        _conn = MySQLdb.connect(host=_host,user=_user,passwd=_password,port=_port,db=_db)
+        _cur = _conn.cursor(cursorclass=MySQLdb.cursors.DictCursor)
+        _cur.execute(sql)
+        rows=_cur.fetchall()
+        _conn.commit()
+    except Exception,e:
+        print e
+    finally:
+        return rows
+
+class IndexHandler(tornado.web.RequestHandler):
+    def get(self):
+        new_master_host  = self.get_argument('new_master_host','0.0.0.0')
+        port  = self.get_argument('port',0)
+	dead_master_host  = self.get_argument('dead_master_host','0.0.0.0')
+        alive_switch  = self.get_argument('alive_switch','yes').lower()
+        repl_user  = self.get_argument('master_user',None)
+        crypt_repl_password  = self.get_argument('master_password',None)
+        uuid  = self.get_argument('uuid',None)
+        input_is_ok = False
+        print "#"*50
+        print alive_switch
+        print "#"*50
+        if alive_switch =='yes':
+            if new_master_host != '0.0.0.0' and port !=0 :
+                input_is_ok = True
+            else:
+                self.write('''new_master_host and port must be set when alive change''')
+        else:
+            if port !=0 and dead_master_host != '0.0.0.0':
+                input_is_ok = True
+            else:
+                self.write('''dead_master_host and port must be set when master_is dead''')
+        if input_is_ok:
+            if repl_user and crypt_repl_password:
+                key = 'dbsjdcom\0\0\0\0\0\0\0\0'
+                pc = prpcrypt(key)      #初始化密钥
+                repl_password = pc.decrypt(crypt_repl_password)
+                if alive_switch == 'yes':
+                    change_opt = '''--new_master_host=%s --port=%s --online --repl_user=%s --repl_password=%s'''%(new_master_host,port,repl_user,repl_password)
+                else:
+                    change_opt = '''--new_master_host=%s --port=%s --dead_master=%s --repl_user=%s --repl_password=%s'''%(new_master_host,port,dead_master_host,repl_user,repl_password)
+            else:
+                if alive_switch == 'yes':
+                    change_opt = '''--new_master_host=%s --port=%s --online'''%(new_master_host,port)
+                else:
+                    change_opt = '''--new_master_host=%s --port=%s --dead_master=%s'''%(new_master_host,port,dead_master_host)
+            mha_switch_path = '''/usr/local/mysqlha/mysqlha_masterha_master_switch'''
+            mha_switch_cmd = '''%s %s'''%(mha_switch_path,change_opt)
+            print mha_switch_cmd
+            switch_result_log = os.popen(mha_switch_cmd).read()
+            get_cluster_id_sql = '''select cluster_id from t_machine where ip="%s" and port=%s'''%(new_master_host,port)
+            cluster_id_result = jmms_exec_sql(get_cluster_id_sql) 
+            if cluster_id_result and len(cluster_id_result)>0:
+                cluster_id = cluster_id_result[0].get('cluster_id',0)
+            else:
+                cluster_id=0
+            update_host_switch_log_sql = '''update host_switch_log set mha_message="%s" where uuid="%s" and cluster_id=%s'''%(switch_result_log,uuid,cluster_id)
+            print update_host_switch_log_sql
+            jmms_exec_sql(update_host_switch_log_sql)
+            switch_status = 0
+            new_master = ''
+            domain_message = '{}'
+            if len(switch_result_log.split('\n')) > 3:
+                switch_result_log = switch_result_log.replace("'",'"')
+                for l in switch_result_log.split('\n'):
+                    if re.findall(r'completed successfully.$',l):
+                        new_master = l.split('(')[1].split(')')[0]
+                        switch_status = 1
+                    elif re.findall(r'\(new master\)',l):
+                        new_master = l.split('(')[1].split(')')[0]
+                    if re.findall(r'backstatus',l):
+                        domain_message = l
+            if switch_status == 1:
+                #self.write('''{"status":1,"new_master":"%s","info":"%s","domain_message":%s}\n'''%(new_master,switch_result_log.replace('"',""),domain_message))
+                self.write('''{"status":1,"new_master":"%s","domain_message":%s}\n'''%(new_master,domain_message))
+            else:
+                #self.write('''{"status":0,"info":"%s","domain_message":%s}\n'''%(switch_result_log.replace('"',""),domain_message))
+                self.write('''{"status":0,"new_master":"%s","domain_message":%s}\n'''%(new_master,domain_message))
+
+if __name__ == "__main__":
+    tornado.options.parse_command_line()
+    app = tornado.web.Application(handlers=[(r"/", IndexHandler)])
+    http_server = tornado.httpserver.HTTPServer(app)
+    http_server.listen(options.port)
+    tornado.ioloop.IOLoop.instance().start()

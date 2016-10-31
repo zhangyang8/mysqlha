@@ -1,0 +1,352 @@
+#!/usr/bin/python2.6
+#-!-coding:utf8-!-
+conf_path='/usr/local/mysqlha/.mha'
+import threading
+
+class LogMsg(object):
+    import os
+    import datetime
+    def __init__(self,log_file=None):
+        self._log_file = log_file
+
+    def log_msg(self,level = 'debug',messages = None):
+        import logging
+        import logging.config
+        try:
+            file_format='%(asctime)s - %(levelname)s - %(message)s'
+            file_formatter = logging.Formatter(file_format)
+            info_logger = logging.getLogger('log')
+            info_logger.setLevel(logging.DEBUG)
+            info_handler = logging.FileHandler(self._log_file, 'a')
+            info_handler.setLevel(logging.DEBUG)
+            info_handler.setFormatter(file_formatter)
+            info_logger.addHandler(info_handler)
+            if level == 'debug':
+                info_logger.debug(messages)
+            elif level == 'info':
+                info_logger.info(messages)
+            elif level == 'warn':
+                info_logger.warn(messages)
+            elif level == 'error':
+                info_logger.error(messages)
+            elif level == 'critical':
+                info_logger.critical(messages)
+            else:
+    	        info_logger.error('level is wrong,input is %s'%(level))
+        except Exception,e:
+            print e
+            info_logger.critical(str(e))
+
+def get_host_list(cluster_id = None):
+    try:
+        import MySQLdb
+        _host = 'my11991m.mysql.jddb.com'
+        _port = 3358
+        _user = 'mha_ro'
+        _password = 'XXXXXXXXX'
+        _db = 'jmms'
+        _conn = MySQLdb.connect(host=_host,user=_user,passwd=_password,port=_port,db=_db)
+        _cur = _conn.cursor(cursorclass=MySQLdb.cursors.DictCursor)
+        sql = '''select ip,port,1 "candidate_master" from t_machine where cluster_id=%s and status=1'''%(cluster_id)
+        _cur.execute(sql)
+        rows=_cur.fetchall()
+        _conn.commit()
+    except Exception,e:
+        print e
+    finally:
+        return rows 
+
+
+def get_cluster_id(mysql_ip=None,mysql_port=None):
+    try:
+        import MySQLdb
+        _host = 'my11991m.mysql.jddb.com'
+        _port = 3358
+        _user = 'mha_ro'
+        _password = 'XXXXXXXXX'
+        _db = 'jmms'
+        _conn = MySQLdb.connect(host=_host,user=_user,passwd=_password,port=_port,db=_db)
+        _cur = _conn.cursor(cursorclass=MySQLdb.cursors.DictCursor)
+        sql = '''select cluster_id from t_machine where ip="%s" and port=%s and status=1'''%(mysql_ip,mysql_port)
+        _cur.execute(sql)
+        cluster_id_dic=_cur.fetchall()
+        _conn.commit()
+    except Exception,e:
+        print e
+    finally:
+        return cluster_id_dic
+
+def get_user_from_cnf(conf=None):
+    try:
+        import ConfigParser
+        user_dic={}
+        config = ConfigParser.ConfigParser()
+        config.read(conf)
+        section=config.sections()
+        for i in section:
+            #user_dic['repl_user']=config.get(i, "repl_user")
+            #user_dic['repl_password']=config.get(i, "repl_password")
+            user_dic['user']=config.get(i, "user")
+            user_dic['password']=config.get(i, "password")
+    except Exception,e:
+        print e
+    finally:
+        return user_dic
+
+
+def add_to_app_conf(app_conf=None,cluster_id = None,host_port_list = None,new_master_host=None,repl_user_dic={}):
+    try:
+        import os
+        os.popen('echo "">%s'%(app_conf))
+        add_to_conf_success = True
+        for host_port in host_port_list:
+            instance_ip=host_port.get('ip','0.0.0.0')
+            instance_port=host_port.get('port','0000')
+            candidate_master=host_port.get('candidate_master',0)
+            if new_master_host == '0':
+                if candidate_master:
+                    is_candidate_master=1
+                else:
+                    is_candidate_master=0
+            else:
+                if new_master_host==instance_ip:
+                    is_candidate_master=1
+                else:
+                    is_candidate_master=0
+            cmd='''masterha_conf_host --command=add --conf=%s --hostname=%s --block=_%s --params="port=%s;ignore_fail=1;latest_priority=0;candidate_master=%s;repl_user=%s;repl_password=%s"'''%(app_conf,instance_ip,instance_ip,instance_port,is_candidate_master,repl_user_dic.get('repl_user','repl'),repl_user_dic.get('repl_password',''))
+            result = exec_shell_cmd(cmd)
+            if result.get('status') == 0:
+                add_to_conf_success=False
+    except Exception,e:
+        print e
+    finally:
+        return add_to_conf_success
+
+def exec_shell_cmd (shell_cmd=None,*args,**kwargs):
+    try:
+        import os
+        import re
+        shell_cmd = '%s;echo $?'%(shell_cmd)
+        #shell_cmd = '%s;echo $?|tee -a %s/%s'%(shell_cmd,l._path,l._name)
+        cmd_result=os.popen(shell_cmd).read().rstrip()
+        result = {}
+        if re.findall(r'0$',cmd_result):
+            result['status']=1
+            result['info']=cmd_result[0:-3].rstrip()
+        else:
+            result['status']=0
+            result['info']=cmd_result[0:-3].rstrip()
+    except Exception,e:
+        result['status'] = 0 
+        raise
+    finally:
+        return result
+
+
+
+def parall_grants_for_repl(repl_user_dic=None,host_list=None):
+    try:
+        import thread
+        import datetime 
+        is_ok=False
+        thread_list = []
+        for host in host_list:
+            for grant_host in host_list:
+                t=grantThread(repl_user_dic, host, grant_host)
+                thread_list.append(t)
+        for thread in thread_list:
+            thread.start()
+        for thread in thread_list:
+            thread.join()
+    except Exception,e:
+        raise
+    finally:
+        return is_ok
+
+
+class grantThread (threading.Thread):
+    def __init__(self,repl_user_dic=None, host=None, grant_host=None):
+        threading.Thread.__init__(self)
+        self.repl_user_dic = repl_user_dic
+        self.host = host
+        self.grant_host = grant_host
+    def run(self):
+        import MySQLdb
+        import time
+        is_ok=False
+        _host = self.grant_host.get('ip')
+        _granted_host = self.host.get('ip')
+        _port = self.grant_host.get('port')
+        _user = self.repl_user_dic.get('user','root')
+        _password = self.repl_user_dic.get('password','')
+        _db = 'mysql'
+        for i in range(10):
+            granted = False
+            try:
+                _conn = MySQLdb.connect(host=_host,user=_user,passwd=_password,port=_port,db=_db,connect_timeout=3)
+                _cur = _conn.cursor(cursorclass=MySQLdb.cursors.DictCursor)
+                _sql = '''GRANT REPLICATION SLAVE ON *.* TO "%s"@"%s" IDENTIFIED BY "%s";'''%(self.repl_user_dic.get('repl_user','repl'),_granted_host,self.repl_user_dic.get('repl_password','CSeaegBvuUmVXwVS'))
+                _cur.execute(_sql)
+                _sql = '''flush privileges;'''
+                _check_grants_sql = '''select count(*) granted from mysql.user where user="%s" and host="%s"'''%(self.repl_user_dic.get('repl_user','repl'),_granted_host)
+                _cur.execute(_sql)
+                _cur.execute(_check_grants_sql)
+                _result=_cur.fetchall()
+                if _result and _result[0].get('granted',0) > 0:
+                    granted = True
+            except Exception,e:
+                print 'grants REPLICATION on %s to %s failed......%s'%(_host,_granted_host,e)
+            if granted:
+                is_ok=True
+                break
+        if is_ok:
+            log_obj.log_msg('info','grants REPLICATION on %s to %s success'%(_host,_granted_host))
+            print 'grants REPLICATION on %s to %s success'%(_host,_granted_host)
+
+
+def enable_relay_log_purge(repl_user_dic=None,host_list=None):
+    try:
+        import time
+        import MySQLdb
+        is_ok=False
+        for mysql_host in host_list:
+            _host = mysql_host.get('ip')
+            _port = mysql_host.get('port')
+            _user = repl_user_dic.get('user','root')
+            _password = repl_user_dic.get('password','')
+            _db = 'mysql'
+            _conn = MySQLdb.connect(host=_host,user=_user,passwd=_password,port=_port,db=_db)
+            _cur = _conn.cursor(cursorclass=MySQLdb.cursors.DictCursor)
+            _sql = '''set global relay_log_purge=1;'''
+            _cur.execute(_sql)
+            _cur.execute(_sql)
+            cluster_id_dic=_cur.fetchall()
+            _conn.commit()
+            is_ok=True
+    except Exception,e:
+        print e
+    finally:
+        return is_ok
+
+if __name__ == "__main__":
+    try:
+        import os
+        import datetime
+        import sys
+        from optparse import OptionParser
+        result={'status':1}
+        opt=OptionParser()
+        opt.add_option('--cluster_id',\
+        dest = 'cluster_id',\
+        type = int,\
+        help = 'id of mysql cluster')
+        opt.add_option('--online',\
+        action="store_true", dest="online",default=False, 
+        help="set this option if master is alive")
+        opt.add_option('--port',\
+        dest = 'port',\
+        type = str,\
+        help = 'port of mysql cluster,must be set')
+        opt.add_option('--dead_master_host',\
+        dest = 'dead_master_host',\
+        type = str,\
+        help = 'ip of dead master,must be set when not set online option')
+        opt.add_option('--new_master_host',\
+        dest = 'new_master_host',\
+        type = str,\
+        help = 'ip of new master,mha will auto select one as new master when not set')
+        opt.add_option('--repl_user',\
+        dest = 'repl_user',\
+        type = str,\
+        help = 'user of replication')
+        opt.add_option('--repl_password',\
+        dest = 'repl_password',\
+        type = str,\
+        help = 'password of replication')
+        (options,args) = opt.parse_args()
+        my_cluster_id = options.cluster_id
+        my_port = options.port
+        my_online = options.online
+        my_repl_user = options.repl_user
+        my_repl_password = options.repl_password
+        my_dead_master = options.dead_master_host
+        my_new_master = options.new_master_host
+        global_conf=os.path.join(conf_path,'masterha_default.cnf')
+        user_dic = get_user_from_cnf(global_conf)
+        if not my_port and not my_cluster_id:
+            result['status']=0
+            result['info']='''port of mysql cluster must be set !!!'''
+        if not (my_dead_master or my_new_master or my_cluster_id):
+            result['status']=0
+            result['info']='''when cluster id not setted,one of dead_master_host/new_mster_host must be set !!!'''
+        if not my_online:
+            if not my_dead_master:
+                result['status']=0
+                result['info']='''dead_master_host must be set when master is dead !!!'''
+        if not my_new_master:
+            my_new_master='1'
+            result['info']='''%s\nnot set new master,new master will auto selected!'''%(result.get('info',''))
+        if my_repl_user and my_repl_password:
+            repl_user_dic = {'repl_user':my_repl_user,'repl_password':my_repl_password,'user':user_dic.get('user','root'),'password':user_dic.get('password')}
+        else:
+            repl_user_dic = {'repl_user':'repl','repl_password':'CSeaegBvuUmVXwVS','user':user_dic.get('user','root'),'password':user_dic.get('password')}
+        if result['status'] == 1:
+            if not my_cluster_id:
+                if not my_dead_master:
+                    mysql_ip=my_new_master 
+                else:
+                    mysql_ip=my_dead_master 
+                if get_cluster_id(mysql_ip,my_port) and len(get_cluster_id(mysql_ip,my_port))>0:
+                    my_cluster_id=get_cluster_id(mysql_ip,my_port)[0].get('cluster_id',0)
+                else:
+                    my_cluster_id = 0
+            if my_cluster_id > 0:
+                app_conf=os.path.join(conf_path,'./cnf/app_%s.cnf'%(my_cluster_id))
+                host_list = get_host_list(my_cluster_id)
+                log_file_post='''%s_%s.log'''%(my_cluster_id,datetime.datetime.now().strftime('%Y%m%d%H%M%S'))
+                log_file_path='''/var/log'''
+                if len(host_list)>=2:
+                    if my_online:
+                        mha_switch_cmd='''masterha_master_switch --global_conf=%s --conf=%s --master_state=alive --interactive=0 --orig_master_is_new_slave'''%(global_conf,app_conf)
+                        log_file_name='''online_%s'''%(log_file_post)
+                    else:
+                        my_dead_master_port=3358
+                        log_file_name='''failover_%s'''%(log_file_post)
+                        for i in host_list:
+                            if i.get('ip')==my_dead_master:
+                                my_dead_master_port=i.get('port')
+                                break
+                        mha_switch_cmd='''masterha_master_switch --global_conf=%s --conf=%s --master_state=dead --dead_master_host=%s --dead_master_ip=%s --dead_master_port=%s --interactive=0'''%(global_conf,app_conf,my_dead_master,my_dead_master,my_dead_master_port)
+                    log_file=os.path.join(log_file_path,log_file_name)
+                    log_obj = LogMsg(log_file)
+                    if add_to_app_conf(app_conf,my_cluster_id,host_list,my_new_master,repl_user_dic):
+                        log_obj.log_msg("info","add %s to %s success"%(host_list,app_conf))
+                    else:
+                        log_obj.log_msg("info","add %s to %s failed"%(host_list,app_conf))
+                        sys.exit(1)
+                    full_mha_switch_cmd = '''%s 2>&1|tee -a %s'''%(mha_switch_cmd,log_file)
+                    parall_grants_for_repl(repl_user_dic,host_list)
+                    print full_mha_switch_cmd
+                    print os.popen(full_mha_switch_cmd).read(),
+                    grep_warn_cmd = '''egrep -i "\<Warning\>|\<warn\>" %s'''%(log_file)
+                    warn_info = os.popen(grep_warn_cmd).read().lstrip()
+                    #if warn_info:
+                    #    print '%s%s%s'%('\033[33m',warn_info,'\033[0m')
+                    grep_error_cmd = '''egrep -i "\<error\>" %s'''%(log_file)
+                    error_info = os.popen(grep_error_cmd).read().lstrip()
+                    #if error_info:
+                    #    print '%s%s%s'%('\033[31m',error_info,'\033[0m')
+                    if my_online: 
+                        enable_relay_log_purge(repl_user_dic,host_list)
+                else:
+                    result['status']=0
+                    result['info']='''%s\nonly one instance found,can not change it!!!'''%(result['info'])
+            else:
+                print 'get cluster_id failed' 
+    except Exception,e:
+        print e
+    finally:
+        if result['status']==0: 
+            print result.get('info')
+
+
