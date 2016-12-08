@@ -17,71 +17,133 @@ from tornado.options import define, options
 mysql_host='orajdb.mysql.jddb.com'
 mysql_port=3358
 mysql_user='jd_mha_manager'
-mysql_pass='xxxxxxxxxxxxxxx'
+mysql_pass='XXXXX'
 mysql_db='jdd_ops'
+dbs_host='my11991m.mysql.jddb.com'
+dbs_port=3358
+dbs_user='maintenance_rw'
+dbs_pass='XXXXX'
+dbs_db='dbs_log'
+retry_minutes = 5
+http_port = 8000
 def gen_inventory(host = None):
     try:
         import os
         inventory_file = 'inventory_%s'%(host)
-        inventory_path = '.ansible_inventory'
-        ansible_ssh_user = 'root'
-        ansible_ssh_pass = 'xxxxxxxxxxxxxxx'
+        inventory_path = '/tmp/.ansible_inventory'
+        #ansible_ssh_user = 'root'
+        #ansible_ssh_pass = 'Root_JD.com_0811'
         inventory_file_path = os.path.join(inventory_path,inventory_file)
         os.system('mkdir -p %s'%(inventory_path))
         os.system('echo "[initted]">%s'%(inventory_file_path))
-        os.system('echo "%s">>%s'%(host,inventory_file_path))
+        os.system('echo "%s ansible_ssh_user=jdadmin ansible_ssh_private_key_file=/home/jdadmin/.ssh/id_rsa">>%s'%(host,inventory_file_path))
         inventory = inventory_file_path
     except Exception,e:
         raise e
     finally:
         return inventory
 
-
 def backup_mysql(host=None,port=3358,method='xtra'):
     try:
         import os
+        import socket
         import datetime
         import ansible.runner
         import datetime
-        remote_backup_cmd='''python2.6 /usr/local/mysqlha/mysqlha_backup --port=%s --method=%s'''%(port,method)
-        #remote_backup_cmd='''hostname'''
-        inventory_file = gen_inventory(host)
+        import re
+        print 'start backup mysql %s:%s in method:%s'%(host,port,method)
+        ip = socket.gethostbyname(host)
+        pause_replication_delay_monitor(ip)
+        inventory_file = gen_inventory(ip)
+        fail_info = ''
+        backup_script='/usr/local/mysqlha/mysqlha_backup'
         runner = ansible.runner.Runner(
-           host_list = "./%s"%(inventory_file),
-           module_name = 'command',
-           module_args = remote_backup_cmd,
+           host_list = "%s"%(inventory_file),
+           module_name = 'ping',
+           module_args = '',
            pattern='initted',
-           #sudo = True,
-           remote_user='root',
-           remote_pass='xxxxxxxxxxxxxxx',
+           #sudo = true,
+           #sudo_user='root',
+           #remote_user='root',
+           #remote_pass='Root_JD.com_0811',
         )   
-        result = runner.run()
-        #os.system('echo "%s" >> ./aps.log'%(result))
+        ping_result = runner.run()
+        if ping_result.get('contacted',{}).get(ip,{}).get('ping','') == 'pong':
+            check_backup_cmd='''ls %s'''%(backup_script)
+            runner = ansible.runner.Runner(
+               host_list = "%s"%(inventory_file),
+               module_name = 'shell',
+               module_args = check_backup_cmd,
+               pattern='initted',
+               #sudo = true,
+               #sudo_user='root',
+               #remote_user='root',
+               #remote_pass='Root_JD.com_0811',
+            )   
+            check_result = runner.run()
+            if check_result.get('contacted',{}).get(ip,{}).get('stdout','') == backup_script:
+                remote_backup_cmd='''sudo nohup python2.6 %s --port=%s --method=%s &'''%(backup_script,port,method)
+                runner = ansible.runner.Runner(
+                   host_list = "%s"%(inventory_file),
+                   module_name = 'shell',
+                   module_args = remote_backup_cmd,
+                   pattern='initted',
+                   #sudo = true,
+                   #sudo_user='root',
+                   #remote_user='root',
+                   #remote_pass='Root_JD.com_0811',
+                 )
+                result = {}
+                try:
+                   result = runner.run()
+                   print result
+                except Exception,e:
+                    raise e
+                #if result.get('contacted',{}).get(ip,{}).get('stdout','')=='':
+                #stdout = result.get('contacted',{}).get(ip,{}).get('stdout','')
+                #stderr = result.get('contacted',{}).get(ip,{}).get('stderr','')
+                #if re.findall(r'compress backup file success',stdout) or re.findall(r'compress backup file success',stderr):
+                #    pass
+                #else:
+                #    fail_info = 'Execute backup command failed'
+            else:
+                fail_info = '''check mysqlha_backup failed'''
+        else:
+            fail_info = '''%s'''%(ping_result.get('dark',{}).get(ip,{}).get('msg','').replace('"',"'")[0:200])
+        if fail_info:
+            cluster_id = get_cluster_id(ip,port)
+            get_latest_continue_fail_counts_sql = '''SELECT continue_fail_counts from jd_db_backup_detail d where cluster_id="%s" order by backup_start_time desc limit 1'''%(cluster_id)
+            latest_continue_fail_counts_result_dic = ops_obj._exec_sql(get_latest_continue_fail_counts_sql)
+            if latest_continue_fail_counts_result_dic and len(latest_continue_fail_counts_result_dic) > 0:
+                latest_continue_fail_counts = latest_continue_fail_counts_result_dic[0].get('continue_fail_counts',0)
+            else:
+                latest_continue_fail_counts = 0
+            get_latest_retry_counts_sql = '''SELECT retry_counts+1 retry_counts from jd_db_backup_detail d where cluster_id="%s" and db_ip=INET_ATON("%s") and backup_start_time >= date_sub(NOW(), INTERVAL "12" HOUR ) and (backup_start_time >= date_sub(NOW(), INTERVAL "10" MINUTE) or backup_end_time >= date_sub(NOW(), INTERVAL "%s*2" MINUTE)) order by backup_start_time desc limit 1'''%(cluster_id,ip,retry_minutes)
+            latest_retry_counts_result = ops_obj._exec_sql(get_latest_retry_counts_sql)
+            if latest_retry_counts_result and len(latest_retry_counts_result)>0:
+                latest_retry_counts = latest_retry_counts_result[0].get('retry_counts',0)
+            else:
+                latest_retry_counts = 0
+            recorde_backup_sql = '''insert into jd_db_backup_detail(cluster_id,db_ip,db_port,db_backup_method,db_type,backup_start_time,backup_status,info,continue_fail_counts,retry_counts) values ("%s",inet_aton("%s"),"%s","%s","mysql",now(),"failed","%s","%s",%s)'''%(cluster_id,ip,port,method,fail_info,latest_continue_fail_counts+1,latest_retry_counts)
+            ops_obj._exec_sql(recorde_backup_sql)
+        #enable_replication_delay_monitor_sql = '''update maintenance set time_stop = DATE_ADD(NOW(), INTERVAL 1 MINUTE),time_operate= DATE_ADD(NOW(), INTERVAL 1 MINUTE) where ip="%s" and type="Replication Delay"'''%(ip)
+        #dbs_obj._exec_sql(enable_replication_delay_monitor_sql)
     except Exception, e:
         raise e
 
-#def backup_mysql(host=None,port=3358,method='xtra'):
-#    try:
-#        import os
-#        import datetime
-#        import ansible.runner
-#        remote_backup_cmd='''/usr/local/mysqlha/mysqlha_backup --port=%s --method=%s'''%(port,method)
-#        #remote_backup_cmd='''echo `date` >> /var/log/aaa.log'''
-#        inventory_file = gen_inventory(host)
-#        runner = ansible.runner.Runner(
-#           host_list = "./%s"%(inventory_file),
-#           module_name = 'command',
-#           module_args = remote_backup_cmd,
-#           pattern='initted',
-#           #sudo = True,
-#           remote_user='root',
-#           remote_pass='xxxxxxxxxxxxxxx',
-#        )
-#        result = runner.run()
-#        #os.system('echo "%s" >> ./aps.log'%(result))
-#    except Exception, e:
-#        print e
-#        raise e
+def pause_replication_delay_monitor(host = None):
+    try:
+        maintance_result=[]
+        get_maintance_sql = '''SELECT 1 "maintanced" FROM maintenance m WHERE m.ip = "%s" AND (( m.time_start BETWEEN NOW() AND DATE_ADD(NOW(), INTERVAL 3 HOUR)) OR ( NOW() BETWEEN m.time_start AND m.time_stop )) AND state IN (0, 1)'''%(host)
+        maintance_result = dbs_obj._exec_sql(get_maintance_sql)
+        if len(maintance_result) > 0:
+            pass
+        else:
+           maintain_replication_delay_sql = '''insert into maintenance (ip, server_group, type, reason, operator, time_operate, time_start, time_stop, state) values ("%s", "%s", "Replication Delay", "数据库备份", "数据库备份", now(), now(), DATE_ADD(NOW(), INTERVAL 5 HOUR), 0)'''%(host,"Oracle")
+           dbs_obj._exec_sql(maintain_replication_delay_sql)
+    except Exception, e:
+        raise "pause_replication_delay_monitor:%s"%(e)
+
 def get_backup_report():
     try:
         import datetime
@@ -92,7 +154,57 @@ def get_backup_report():
         start_time_str = datetime.datetime.strftime(start_time, "%Y-%m-%d %H:%M:%S")
         end_time_str = datetime.datetime.strftime(end_time, "%Y-%m-%d %H:%M:%S")
         backup_summary_dic = {'summary':{}}
-        get_backup_sumary_sql = '''SELECT backup_status,COUNT(*) num from jd_db_backup_detail d where d.backup_start_time >'%s' and d.backup_start_time <'%s' GROUP BY backup_status'''%(start_time_str,end_time_str)
+        get_backup_sumary_sql = '''SELECT
+                            	"success" backup_status,
+                            	COUNT(DISTINCT db_ip) num
+                            FROM
+                            	jd_db_backup_detail d
+                            WHERE
+                            	(
+                            		d.backup_start_time > "%s"
+                            		AND d.backup_start_time < "%s"
+                            	)
+                            OR (
+                            	d.backup_end_time > "%s"
+                            	AND d.backup_end_time < "%s"
+                            )
+                            AND backup_status = "success"
+                            UNION
+                            	SELECT
+                            		"failed" backup_status,
+                            		COUNT(DISTINCT db_ip) num
+                            	FROM
+                            		jd_db_backup_detail d
+                            	WHERE
+                            		(
+                            			(
+                            				d.backup_start_time > "%s"
+                            				AND d.backup_start_time < "%s"
+                            			)
+                            			OR (
+                            				d.backup_end_time > "%s"
+                            				AND d.backup_end_time < "%s"
+                            			)
+                            		)
+                            	AND backup_status = "failed"
+                            	AND db_ip NOT IN (
+                            		SELECT DISTINCT
+                            			db_ip
+                            		FROM
+                            			jd_db_backup_detail
+                            		WHERE
+                            			(
+                            				(
+                            					backup_start_time > "%s"
+                            					AND backup_start_time < "%s"
+                            				)
+                            				OR (
+                            					backup_end_time > "%s"
+                            					AND backup_end_time < "%s"
+                            				)
+                            			)
+                            		AND backup_status in("success","backuping")
+                            	)'''%(start_time_str,end_time_str,start_time_str,end_time_str,start_time_str,end_time_str,start_time_str,end_time_str,start_time_str,end_time_str,start_time_str,end_time_str)
         backup_summary_result_dic = ops_obj._exec_sql(get_backup_sumary_sql)
         for i in backup_summary_result_dic:
             if i.get('backup_status') == 'failed':
@@ -100,19 +212,21 @@ def get_backup_report():
             elif i.get('backup_status') == 'success':
                 backup_summary_dic['summary']['backup_success'] = i.get('num')
         backup_summary_dic['summary']['backup_total'] = backup_summary_dic.get('summary',{}).get('backup_success',0) + backup_summary_dic.get('summary',{}).get('backup_failed',0)
-        get_backup_failed_sql = '''SELECT g.group_name project_name,c.cluster_name,d.cluster_id,inet_ntoa(d.db_ip) mysql_ip,info fail_info,d.continue_fail_counts,u.username dba from jd_db_backup_detail d join jd_clusters c on c.cluster_id=d.cluster_id join jd_group g on c.group_id=g.group_id join auth_user u on g.db_admin=u.id  where backup_status="failed" and d.backup_start_time >"%s" and d.backup_start_time <"%s"'''%(start_time_str,end_time_str)
+        #get_backup_failed_sql = '''SELECT g.group_name project_name, c.cluster_name, d.cluster_id, inet_ntoa(d.db_ip) mysql_ip, info fail_info, (SELECT DATEDIFF(NOW(),MAX(backup_start_time)) FROM jd_db_backup_detail WHERE cluster_id=d.cluster_id AND backup_status='success' ) continue_fail_counts, u.username dba FROM jd_db_backup_detail d JOIN jd_clusters c ON c.cluster_id = d.cluster_id JOIN jd_group g ON c.group_id = g.group_id JOIN auth_user u ON g.db_admin = u.id WHERE backup_status = "failed" AND ( d.cluster_id, d.backup_start_time ) IN ( SELECT di.cluster_id, MAX(di.backup_start_time) FROM jd_db_backup_detail di WHERE (( di.backup_start_time > "%s" AND di.backup_start_time < "%s" ) OR ( di.backup_end_time > "%s" AND di.backup_end_time < "%s" )) GROUP BY di.cluster_id ) AND (( d.backup_start_time > "%s" AND d.backup_start_time < "%s" ) OR ( d.backup_end_time > "%s" AND d.backup_end_time < "%s" )) GROUP BY project_name, c.cluster_name, d.cluster_id, mysql_ip, fail_info, dba ORDER BY continue_fail_counts DESC'''%(start_time_str,end_time_str,start_time_str,end_time_str,start_time_str,end_time_str,start_time_str,end_time_str)
+        get_backup_failed_sql = '''SELECT g.group_name project_name, c.cluster_name, d.cluster_id, inet_ntoa(d.db_ip) mysql_ip, info fail_info, ( SELECT DATEDIFF( NOW(), MAX(backup_start_time)) FROM jd_db_backup_detail WHERE cluster_id = d.cluster_id AND backup_status = 'success' ) continue_fail_counts, u.username dba FROM jd_db_backup_detail d JOIN jd_clusters c ON c.cluster_id = d.cluster_id JOIN jd_group g ON c.group_id = g.group_id JOIN auth_user u ON g.db_admin = u.id WHERE backup_status = "failed" AND ( d.cluster_id, d.backup_start_time ) IN ( SELECT di.cluster_id, MAX(di.backup_start_time) FROM jd_db_backup_detail di WHERE (( di.backup_start_time > "%s" AND di.backup_start_time < "%s" ) OR ( di.backup_end_time > "%s" AND di.backup_end_time < "%s" )) GROUP BY di.cluster_id ) AND (( d.backup_start_time > "%s" AND d.backup_start_time < "%s" ) OR ( d.backup_end_time > "%s" AND d.backup_end_time < "%s" )) AND d.cluster_id NOT IN ( SELECT DISTINCT cluster_id FROM jd_db_backup_detail WHERE backup_start_time >= "%s" AND backup_status IN ("success", "backuping")) GROUP BY project_name, c.cluster_name, d.cluster_id, mysql_ip, fail_info, dba ORDER BY continue_fail_counts DESC'''%(start_time_str,end_time_str,start_time_str,end_time_str,start_time_str,end_time_str,start_time_str,end_time_str,start_time_str)
         backup_summary_result_dic = ops_obj._exec_sql(get_backup_failed_sql)
         if len(backup_summary_result_dic) > 0:
             backup_summary_dic['fail_list'] = backup_summary_result_dic
-        get_backuping_sql = '''SELECT g.group_name project_name,c.cluster_name,d.cluster_id,inet_ntoa(d.db_ip) mysql_ip,info fail_info,u.username dba from jd_db_backup_detail d join jd_clusters c on c.cluster_id=d.cluster_id join jd_group g on c.group_id=g.group_id join auth_user u on g.db_admin=u.id  where backup_status="backuping" and d.backup_start_time >"%s" and d.backup_start_time <"%s"'''%(backup_check_time,start_time_str)
+        get_backuping_sql = '''SELECT g.group_name project_name,c.cluster_name,d.cluster_id,inet_ntoa(d.db_ip) mysql_ip,info fail_info,u.username dba,backup_start_time from jd_db_backup_detail d join jd_clusters c on c.cluster_id=d.cluster_id and c.is_del=0 join jd_group g on c.group_id=g.group_id join auth_user u on g.db_admin=u.id  where backup_status="backuping" and d.backup_start_time >"%s" and d.backup_start_time <"%s"'''%(backup_check_time,start_time_str)
         backuping_result_dic = ops_obj._exec_sql(get_backuping_sql)
         if len(backuping_result_dic) > 0:
             backup_summary_dic['backuping_list'] = backuping_result_dic
-        get_not_in_policy_sql = '''SELECT g.group_name project_name,c.cluster_name,c.cluster_id,u.username dba,p.backup_status from jd_db_backup_policy p right join jd_clusters c on c.cluster_id=p.cluster_id and p.backup_status<>'running' and trigger_type in('interval','cron') join jd_group g on c.group_id=g.group_id join auth_user u on g.db_admin=u.id and c.cluster_id not in (select cluster_id from jd_db_backup_blacklist) order by u.username,project_name,c.cluster_name'''
+        get_not_in_policy_sql = '''SELECT g.group_name project_name, c.cluster_name, c.cluster_id, u.username dba, p.backup_status FROM jd_db_backup_policy p RIGHT JOIN jd_clusters c ON c.cluster_id = p.cluster_id and c.is_del=0
+AND trigger_type IN ('interval', 'cron') JOIN jd_group g ON c.group_id = g.group_id JOIN auth_user u ON g.db_admin = u.id AND c.cluster_id NOT IN ( SELECT cluster_id FROM jd_db_backup_blacklist ) WHERE p.backup_status <> 'running' OR p.backup_status IS NULL ORDER BY u.username, project_name, c.cluster_name'''
         not_in_policy_result_dic = ops_obj._exec_sql(get_not_in_policy_sql)
         if len(not_in_policy_result_dic) > 0:
             backup_summary_dic['not_in_policy'] = not_in_policy_result_dic
-        get_last_7d_unbackup_sql = '''SELECT g.group_name project_name,c.cluster_name,c.cluster_id,u.username dba,p.backup_status from jd_clusters c join jd_group g on c.group_id=g.group_id join auth_user u on g.db_admin=u.id join jd_db_backup_policy p on p.trigger_type in('interval','cron') and p.backup_status="running" and p.cluster_id=c.cluster_id left join jd_db_backup_detail d on d.cluster_id=c.cluster_id and d.backup_start_time<now() and d.backup_start_time>(date_add(now(),interval -7 day)) where d.id is null'''
+        get_last_7d_unbackup_sql = '''SELECT g.group_name project_name, c.cluster_name, c.cluster_id, p.mysql_host, u.username dba, p.trigger_type, p.trigger_json, p.start_date, p.backup_status FROM jd_clusters c JOIN jd_group g ON c.group_id = g.group_id AND c.is_del = 0 JOIN auth_user u ON g.db_admin = u.id JOIN jd_db_backup_policy p ON p.trigger_type IN ('interval', 'cron') AND p.backup_status = "running" AND p.start_date < DATE_ADD(NOW(), INTERVAL - 1 DAY) AND p.cluster_id = c.cluster_id AND p.trigger_type NOT IN ('tmp') WHERE c.cluster_id NOT IN ( SELECT DISTINCT dd.cluster_id FROM jd_db_backup_detail dd WHERE dd.backup_status = 'success' AND dd.backup_start_time < now() AND dd.backup_start_time > ( date_add(now(), INTERVAL - 7 DAY)) UNION SELECT cluster_id FROM jd_db_backup_blacklist )'''
         last_7d_unbackup_result_dic = ops_obj._exec_sql(get_last_7d_unbackup_sql)
         if len(last_7d_unbackup_result_dic) > 0:
             backup_summary_dic['last_7d_unbackup'] = last_7d_unbackup_result_dic
@@ -135,20 +249,20 @@ def monitor_backup():
 			</head>'''
         html_tail = '''</body>
 			</html>'''
-        html_line = '''<HR style="FILTER: alpha(opacity=100,finishopacity=0,style=3)" width="720px" color=BLACK SIZE=5 align="left">'''
+        html_line = '''<HR style="FILTER: alpha(opacity=100,finishopacity=0,style=3)" width="900px" color=BLACK SIZE=5 align="left">'''
         html_content = html_head
-        if backup_report_dic.get('summary'):
+        if backup_report_dic.get('summary',{}):
             if backup_report_dic.get('summary').get('backup_total') == 0:
                 success_rate = format(1, '.3%')
             else:
                 success_rate = format(backup_report_dic.get('summary').get('backup_success',0)/float(backup_report_dic.get('summary').get('backup_total',1)), '.3%')
-            html_content = '''%s<table border="1" width="720px"><tr><th colspan=3 border="1" align="center">备份汇总</th></tr>
+            html_content = '''%s<table border="1" width="900px"><tr><th colspan=3 border="1" align="center">备份汇总</th></tr>
                                 <tr><th align="center" >备份总数</th><th align="center" >备份成功数</th><th align="center">备份成功率</th></tr>
                                 <tr><td align="right">%s</td><td  align="right">%s</td><td  align="right">%s</td></tr></table>'''%(html_content,backup_report_dic.get('summary').get('backup_total'),backup_report_dic.get('summary').get('backup_success',0),success_rate)
         if backup_report_dic.get('not_in_policy'):
             if len(backup_report_dic.get('not_in_policy')) > 0:
                 html_content = '''%s%s'''%(html_content,html_line)
-                html_content = '''%s<table border="1" width="720px"><tr><th colspan=5 border="1" align="center">未启用备份策略列表</th></tr>
+                html_content = '''%s<table border="1" width="900px"><tr><th colspan=5 border="1" align="center">未启用备份策略列表</th></tr>
                                 <tr><th align="center">项目名称</th><th align="center">集群名称</th><th align="center">Cluster ID</th><th align="center">DBA</th><th align="center">备份状态</th></tr>'''%(html_content)
                 for i in  backup_report_dic.get('not_in_policy'):
                     html_content = '''%s<tr><td align="left">%s</td><td align="left">%s</td><td align="left">%s</td><td align="left">%s</td><td align="left">%s</td></tr>'''%(html_content,i.get('project_name'),i.get('cluster_name'),i.get('cluster_id'),i.get('dba'),i.get('backup_status'))
@@ -156,8 +270,8 @@ def monitor_backup():
         if backup_report_dic.get('fail_list'):
             if len(backup_report_dic.get('fail_list')) > 0:
                 html_content = '''%s%s'''%(html_content,html_line)
-                html_content = '''%s<table border="1" width="720px"><tr><th colspan=7 border="1" align="center" >备份失败列表</th></tr>
-                                <tr><th align="center">项目名称</th><th align="center">集群名称</th><th align="center">Cluster ID</th><th align="center">备份机器IP</th><th align="center">备份信息</th><th align="center" >连续失败次数</th><th align="center" >DBA</th></tr>'''%(html_content)
+                html_content = '''%s<table border="1" width="900px"><tr><th colspan=7 border="1" align="center" >备份失败列表</th></tr>
+                                <tr><th align="center">项目名称</th><th align="center">集群名称</th><th align="center">Cluster ID</th><th align="center">备份机器IP</th><th align="center">备份信息</th><th align="center" >无备份天数</th><th align="center" >DBA</th></tr>'''%(html_content)
                 for i in  backup_report_dic.get('fail_list'):
                     if i.get('continue_fail_counts',0) >= 3:
                        comtinue_fail_counts = '''bgcolor="red">%s'''%(i.get('continue_fail_counts'))
@@ -169,22 +283,23 @@ def monitor_backup():
         if backup_report_dic.get('backuping_list'):
             if len(backup_report_dic.get('backuping_list')) > 0:
                 html_content = '''%s%s'''%(html_content,html_line)
-                html_content = '''%s<table border="1" width="720px"><tr><th colspan=7 border="1" align="center" >备份时间过长列表</th></tr>
-                                <tr><th align="center" >项目名称</th><th align="center" >集群名称</th><th align="center" >Cluster ID</th><th align="center" >备份机器IP</th><th align="center" >备份信息</th><th align="center" >连续失败次数</th><th align="center" >DBA</th></tr>'''%(html_content)
-                for i in  backup_report_dic.get('fail_list'):
+                html_content = '''%s<table border="1" width="900px"><tr><th colspan=8 border="1" align="center" >备份时间过长列表</th></tr>
+                                <tr><th align="center" >项目名称</th><th align="center" >集群名称</th><th align="center" >Cluster ID</th><th align="center" >备份机器IP</th><th align="center" >备份信息</th><th align="center" >连续失败次数</th><th align="center" >DBA</th><th align="center" >备份开始时间</th></tr>'''%(html_content)
+                for i in  backup_report_dic.get('backuping_list'):
                     if i.get('continue_fail_counts',0) >= 3:
                        comtinue_fail_counts = ''' bgcolor=" red">%s'''%(i.get('continue_fail_counts'))
                     else:
                        comtinue_fail_counts = '>%s'%(i.get('continue_fail_counts',0))
-                    html_content = '''%s<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td%s</td><td>%s</td></tr>'''%(html_content,i.get('project_name'),i.get('cluster_name'),i.get('cluster_id'),i.get('mysql_ip'),i.get('fail_info'),comtinue_fail_counts,i.get('dba'))
+                    html_content = '''%s<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td%s</td><td>%s</td><td>%s</td></tr>'''%(html_content,i.get('project_name'),i.get('cluster_name'),i.get('cluster_id'),i.get('mysql_ip'),i.get('fail_info'),comtinue_fail_counts,i.get('dba'),i.get('backup_start_time'))
                 html_content = '''%s</table>'''%(html_content)
         if backup_report_dic.get('last_7d_unbackup'):
             if len(backup_report_dic.get('last_7d_unbackup')) > 0:
                 html_content = '''%s%s'''%(html_content,html_line)
-                html_content = '''%s<table border="1" width="720px"><tr><th colspan=7 border="1" align="center">7天内没有备份记录列表</th></tr>
-                                <tr><th align="center" >项目名称</th><th align="center" >集群名称</th><th align="center" >Cluster ID</th><th align="center" >备份机器IP</th><th align="center" >备份信息</th><th align="center" >连续失败次数</th><th align="center" >DBA</th></tr>'''%(html_content)
-                for i in  backup_report_dic.get('fail_list'):
-                    html_content = '''%s<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>'''%(html_content,i.get('project_name'),i.get('cluster_name'),i.get('cluster_id'),i.get('mysql_ip'),i.get('fail_info'),i.get('continue_fail_counts'),i.get('dba'))
+               
+                html_content = '''%s<table border="1" width="900px"><tr><th colspan=8 border="1" align="center">7天内没有备份记录列表</th></tr>
+                                <tr><th align="center" >项目名称</th><th align="center" >集群名称</th><th align="center" >Cluster ID</th><th align="center" >备份机器IP</th><th align="center" >调度类型</th><th align="center" >调度参数</th><th align="center" >备份策略开始时间</th><th align="center" >DBA</th></tr>'''%(html_content)
+                for i in  backup_report_dic.get('last_7d_unbackup'):
+		    html_content = '''%s<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>'''%(html_content,i.get('project_name'),i.get('cluster_name'),i.get('cluster_id'),i.get('mysql_host'),i.get('trigger_type'),i.get('trigger_json'),i.get('start_date'),i.get('dba'))
                 html_content = '''%s</table>'''%(html_content)
         html_content = '''%s%s'''%(html_content,html_tail)
         if html_content <> '%s%s'%(html_head,html_tail):
@@ -201,6 +316,7 @@ def send_mail(mail_subject=None,mail_message=None):
         from email.mime.text import MIMEText
         from email.header import Header 
         sender = 'customer_service@jd.com'
+        #receivers = ['zhangyang16@jd.com']
         receivers = ['mysqlplus@jd.com']
         message = MIMEText('%s'%(mail_message), 'html', 'utf-8')
         message['Subject'] = Header(mail_subject, 'utf-8')
@@ -216,37 +332,60 @@ def send_mail(mail_subject=None,mail_message=None):
         pass
 
 
+def heart_beat():
+    try:
+        pass
+    except Exception,e:
+        raise e
 
+def retry_backup():
+    try:
+        import urllib2
+        remove_old_retry_policy_sql = '''DELETE from jd_db_backup_policy WHERE trigger_type="tmp" AND start_date<DATE_SUB(NOW(),INTERVAL 1 HOUR)'''
+        ops_obj._exec_sql(remove_old_retry_policy_sql)
+        #get_fail_list_sql = '''SELECT distinct cluster_id, INET_NTOA(dd.db_ip) db_ip,db_port FROM jd_db_backup_detail dd WHERE ( dd.cluster_id, dd.backup_start_time ) IN ( SELECT cluster_id, MAX(backup_start_time) FROM jd_db_backup_detail d WHERE d.backup_start_time > DATE_SUB(NOW(), INTERVAL 6 HOUR) GROUP BY d.cluster_id ) AND dd.backup_status = "failed" AND dd.retry_counts <= 3'''
+        get_fail_list_sql = '''SELECT dp.cluster_id, dp.mysql_host, dp.mysql_port FROM jd_db_backup_policy dp JOIN jd_clusters c ON c.cluster_id = dp.cluster_id AND c.is_del = 0 WHERE dp.backup_status = 'running' AND dp.trigger_type IN ('interval', 'cron') AND dp.cluster_id IN ( SELECT DISTINCT cluster_id FROM jd_db_backup_detail dd WHERE ( dd.cluster_id, dd.backup_start_time ) IN ( SELECT cluster_id, MAX(backup_start_time) FROM jd_db_backup_detail d WHERE d.backup_start_time > DATE_SUB(NOW(), INTERVAL 6 HOUR) GROUP BY d.cluster_id ) AND dd.backup_status = "failed" AND dd.retry_counts <= 3 AND cluster_id NOT IN ( SELECT cluster_id FROM jd_db_backup_blacklist )) UNION SELECT dp.cluster_id, dp.mysql_host, dp.mysql_port FROM jd_db_backup_policy dp JOIN jd_clusters c ON c.cluster_id = dp.cluster_id AND c.is_del = 0 WHERE dp.backup_status = 'running' AND trigger_type IN ('interval', 'cron') AND dp.cluster_id NOT IN ( SELECT cluster_id FROM jd_db_backup_detail WHERE backup_status = 'success' AND backup_start_time >= DATE_SUB(NOW(), INTERVAL 4 DAY) AND backup_start_time <= NOW() UNION SELECT cluster_id FROM jd_db_backup_detail WHERE backup_status = 'backuping' AND backup_start_time >= DATE_SUB(NOW(), INTERVAL 4 DAY) AND backup_start_time <= NOW() UNION SELECT cluster_id FROM jd_db_backup_detail WHERE backup_status = 'failed' AND backup_start_time >= DATE_SUB(NOW(), INTERVAL 1 HOUR) AND backup_start_time <= NOW() AND retry_counts >= 2 ) AND dp.cluster_id NOT IN ( SELECT cluster_id FROM jd_db_backup_blacklist ) ORDER BY cluster_id limit 10'''
+        #get_fail_list_sql = '''SELECT dp.cluster_id, dp.mysql_host, dp.mysql_port FROM jd_db_backup_policy dp WHERE dp.backup_status = 'running' AND trigger_type IN ('interval', 'cron') AND cluster_id IN ( SELECT DISTINCT cluster_id FROM jd_db_backup_detail dd WHERE ( dd.cluster_id, dd.backup_start_time ) IN ( SELECT cluster_id, MAX(backup_start_time) FROM jd_db_backup_detail d WHERE d.backup_start_time > DATE_SUB(NOW(), INTERVAL 6 HOUR) GROUP BY d.cluster_id ) AND dd.backup_status = "failed" AND dd.retry_counts <= 3 AND cluster_id NOT IN ( SELECT cluster_id FROM jd_db_backup_blacklist )) UNION SELECT dp.cluster_id, dp.mysql_host, dp.mysql_port FROM jd_db_backup_policy dp WHERE dp.backup_status = 'running' AND trigger_type IN ('interval', 'cron') AND dp.cluster_id NOT IN ( SELECT cluster_id FROM jd_db_backup_detail WHERE backup_status = 'success' AND backup_start_time >= DATE_SUB(NOW(), INTERVAL 4 DAY) AND backup_start_time <= NOW() UNION SELECT cluster_id FROM jd_db_backup_detail WHERE backup_status = 'backuping' AND backup_start_time >= DATE_SUB(NOW(), INTERVAL 4 DAY) AND backup_start_time <= NOW() UNION SELECT cluster_id FROM jd_db_backup_detail WHERE backup_status = 'failed' AND backup_start_time >= DATE_SUB(NOW(), INTERVAL 1 HOUR) AND backup_start_time <= NOW() AND retry_counts >= 2 ) AND cluster_id NOT IN ( SELECT cluster_id FROM jd_db_backup_blacklist ) ORDER BY cluster_id'''
+        fail_list_result = ops_obj._exec_sql(get_fail_list_sql)
+        if len(fail_list_result) > 0:
+            for i in fail_list_result:
+                cluster_id = i.get('cluster_id')
+                db_ip = i.get('mysql_host')
+                db_port = i.get('mysql_port')
+                get_backup_method_sql = '''SELECT backup_method FROM jd_db_backup_policy WHERE cluster_id=%s AND backup_status="running" AND trigger_type in("interval","cron") LIMIT 1'''%(cluster_id)
+                backup_method_result = ops_obj._exec_sql(get_backup_method_sql)
+                if len(backup_method_result)>0 :
+                    backup_method = backup_method_result[0].get('backup_method')
+                    #print "http://127.0.0.1:%s/?opt=add_tmp_backup&host=%s&port=%s&method=%s"%(http_port,db_ip,db_port,backup_method)
+                    response = urllib2.urlopen("http://127.0.0.1:%s/?opt=add_tmp_backup&host=%s&port=%s&method=%s"%(http_port,db_ip,db_port,backup_method))
+                    print response.read()
+                    #self.add_tmp_backup(host = db_ip,port = db_port,method = backup_method)
+                else:
+                    pass
+    except Exception, e:
+        print e
 
 jobstores = {
     'default': SQLAlchemyJobStore(url='mysql://%s:%s@%s:%s/%s'%(mysql_user,mysql_pass,mysql_host,mysql_port,mysql_db))
 }
 executors = {
-    'default': ThreadPoolExecutor(20),
-    'processpool': ProcessPoolExecutor(5)
+    'default': ThreadPoolExecutor(1000),
+    'processpool': ProcessPoolExecutor(1000)
 }
 job_defaults = {
     'coalesce': True,
     'misfire_grace_time':46800, 
-    'max_instances': 3
+    'max_instances': 5000
 }
-define("port", default=8000, help="run on the given port", type=int)
+define("port", default=http_port, help="run on the given port", type=int)
 
 class IndexHandler(tornado.web.RequestHandler):
     def get(self):
         import datetime
         import time
-        #self.datetime_now = datetime.datetime.now()
-        #self.datetime_endtime = self.datetime_now + datetime.timedelta(days=36500)
-        #self.datetime_now_str = self.datetime_now.strftime("%Y%m%d%H%M%S")
-        #self.datetime_endtime_str = self.datetime_endtime.strftime("%Y%m%d%H%M%S")
+        import random
         self.opt = self.get_argument('opt', 'start_scheduler')
-        #self.start_date_str = self.get_argument('start_date',self.datetime_now_str)
-        #self.end_date_str = self.get_argument('end_date',self.datetime_endtime_str)
-        ##self.start_date = datetime.datetime.strptime(self.start_date_str, "%Y%m%d%H%M%S").strftime("%Y-%m-%d %H:%M:%S")
-        #self.start_date = datetime.datetime.strptime(self.start_date_str, "%Y%m%d%H%M%S")
-        ##self.end_date = datetime.datetime.strptime(self.end_date_str, "%Y%m%d%H%M%S").strftime("%Y-%m-%d %H:%M:%S")
-        #self.end_date = datetime.datetime.strptime(self.end_date_str, "%Y%m%d%H%M%S")
+        self.retry_minutes = retry_minutes
         if self.opt in ['add_interval_backup','add_cron_backup','add_tmp_backup']:
             self.job_start_date = self.get_argument('start_date',None)
             if self.opt == 'add_tmp_backup':
@@ -256,7 +395,8 @@ class IndexHandler(tornado.web.RequestHandler):
             if self.job_start_date:
                 self.start_date = datetime.datetime.strptime(self.job_start_date, "%Y%m%d%H%M%S")
             else:
-                self.start_date = datetime.datetime.now()
+                random_minutes = int(1440*random.random())
+                self.start_date = datetime.datetime.now() + datetime.timedelta(minutes=random_minutes)
             if self.job_end_date:
                 self.end_date = datetime.datetime.strptime(self.job_end_date, "%Y%m%d%H%M%S")
             else:
@@ -265,43 +405,44 @@ class IndexHandler(tornado.web.RequestHandler):
             self.start_scheduler()
         elif self.opt == 'add_interval_backup':
             self.host = self.get_argument('host')
-            self.port = self.get_argument('port')
+            self.port = int(self.get_argument('port'))
             self.method = self.get_argument('method','xtra')
             self.interval_time_type = self.get_argument('interval_time_type','days')
             self.interval_time_length = self.get_argument('interval_time_length',1)
-            self.host = self.get_argument('host')
-            self.add_interval_backup(host = self.host,
-                        port = self.port,
-                        method = self.method,
-                        interval_time_type = self.interval_time_type,
-                        interval_time_length = self.interval_time_length,
-                        job_start_date = self.start_date,
-                        job_end_date = self.end_date)
+            if get_cluster_id(self.host,self.port): 
+                self.add_interval_backup(host = self.host,
+                            port = self.port,
+                            method = self.method,
+                            interval_time_type = self.interval_time_type,
+                            interval_time_length = self.interval_time_length,
+                            job_start_date = self.start_date,
+                            job_end_date = self.end_date)
+            else:
+                self.write('''%s is not avaliable''')
         elif self.opt == 'add_cron_backup':
             self.host = self.get_argument('host')
             self.port = self.get_argument('port')
             self.method = self.get_argument('method','xtra')
-            self.add_cron_backup(host = self.host,
+            if get_cluster_id(self.host,self.port): 
+                self.add_cron_backup(host = self.host,
                         port = self.port,
                         method = self.method,
-                        #cron_year = self.get_argument('year','*'),
-                        #cron_month = self.get_argument('month','*'),
                         cron_day = self.get_argument('day','1/*'),
-                        #cron_week = self.get_argument('week','*'),
-                        #cron_dayofweek = self.get_argument('day_of_week','*'),
-                        #cron_hour = self.get_argument('hour','*'),
-                        #cron_minute='*',
-                        #cron_second='*',
                         job_start_date = self.start_date,
                         job_end_date = self.end_date)
+            else:
+                self.write('''%s is not avaliable''')
         elif self.opt == 'add_tmp_backup':
             self.host = self.get_argument('host')
             self.port = self.get_argument('port')
             self.method = self.get_argument('method','xtra')
-            self.add_tmp_backup(host = self.host,
+            if get_cluster_id(self.host,self.port): 
+                self.add_tmp_backup(host = self.host,
                         port = self.port,
                         method = self.method,
-                        job_start_date = self.start_date)
+                        job_start_date = datetime.datetime.now())
+            else:
+                self.write('''%s is not avaliable''')
         elif self.opt == 'get_jobs':
             self.get_jobs()
         elif self.opt == 'remove_job':
@@ -316,16 +457,30 @@ class IndexHandler(tornado.web.RequestHandler):
         elif self.opt == 'start_backup_report_monitor':
             self.start_backup_report_monitor(9,17)
             self.write('''{status:1,info:"report monitor add success"}''')
-        else:
+        elif self.opt == 'get_backup_report':
             monitor_backup()
-            #self.write('''%s'''%(get_backup_report()))
-            self.write('''{status:0,info:"opt must be int [start_scheduler,add_interval_backup,add_cron_backup,add_tmp_backup,get_jobs,remove_job,pause_job,resume_job]"}''')
+            self.write('''backup report sended''')
+        else:
+            self.write('''{status:0,info:"opt must be int [start_scheduler,add_interval_backup,add_cron_backup,add_tmp_backup,get_jobs,remove_job,pause_job,resume_job,start_backup_report_monitor,get_backup_report]"}''')
+    def start_heart_beat(self):
+    	try:
+            scheduler.add_job(heart_beat,trigger = 'interval',id = 'scheduler_heart_beat',name = 'scheduler_heart_beat',seconds = 5,replace_existing = True,max_instances=10)
+            #pass
+        except Exception, e:
+            print e
 
+    def start_retry_backup(self):
+    	try:
+            scheduler.add_job(retry_backup,trigger = 'interval',id = 'scheduler_retry_backup',name = 'scheduler_retry_backup',minutes = self.retry_minutes,replace_existing = True,max_instances=10)
+        except Exception, e:
+            print e
     def start_scheduler(self):
         if scheduler.running:
             self.write('''{status:1,info:"scheduler is already running"}''')
         else:
             scheduler.start()
+            self.start_heart_beat()
+            self.start_retry_backup()
             if scheduler.running:
                 self.write('''{status:1,info:"scheuler start sucess"}''')
             else:
@@ -356,7 +511,6 @@ class IndexHandler(tornado.web.RequestHandler):
 			end_date = job_end_date, 
 			minutes = self.interval_time_length, 
 			replace_existing = True)
-                    #self.write('''{status:1,job_id:%s,info:"job add success"}'''%(backup_id))
                     job_added = True
                 elif interval_time_type == 'hours':
                     scheduler.add_job(backup_mysql, 
@@ -368,7 +522,6 @@ class IndexHandler(tornado.web.RequestHandler):
 			end_date = job_end_date, 
 			hours = self.interval_time_length, 
 			replace_existing = True)
-                    #self.write('''{status:1,job_id:%s,info:"job add success"}'''%(backup_id))
                     job_added = True
                 elif interval_time_type == 'days':
                     scheduler.add_job(backup_mysql, 
@@ -381,7 +534,6 @@ class IndexHandler(tornado.web.RequestHandler):
 		        days = self.interval_time_length, 
 		        replace_existing = True)
                     job_added = True
-                    #self.write('''{status:1,job_id:%s,info:"job add success"}'''%(backup_id))
                 elif interval_time_type == 'weeks':
                     scheduler.add_job(backup_mysql, 
 			trigger = 'interval', 
@@ -393,7 +545,6 @@ class IndexHandler(tornado.web.RequestHandler):
 			weeks = self.interval_time_length, 
 			replace_existing = True)
                     job_added = True
-                    #self.write('''{status:1,job_id:%s,info:"job add success"}'''%(backup_id))
                 else:
                     self.write('''{status:0,info:"interval time type must be in (hours,days,weeks)"}''')
                 if job_added:
@@ -403,7 +554,6 @@ class IndexHandler(tornado.web.RequestHandler):
                     
             except ValueError, e:
                 self.write('''{status:0,info:"interval_time_length must be int"}''')
-                #raise e
             except Exception, e:
                 raise e
         else:
@@ -417,22 +567,11 @@ class IndexHandler(tornado.web.RequestHandler):
 			host = None,
 			port = 3358,
 			method = 'xtra',
-                        #cron_year=None, 
-			#cron_month=None, 
 			cron_day=None, 
-			#cron_week=None, 
-			#cron_day_of_week=None, 
-			#cron_hour=None, 
-			#cron_minute=None, 
-			#cron_second=None,
                         job_start_date = None,
                         job_end_date = None):
         import datetime
         cluster_id = get_cluster_id(host,port)
-        #if job_start_date:
-        #    next_run_time=datetime.datetime.strptime(job_start_date, "%Y%m%d%H%M%S")
-        #else:
-        #    next_run_time=datetime.datetime.now()
         backup_id='mysql_backup_%s_cron_%s_%s'%(cluster_id,'day',cron_day)
         if scheduler.running:
             try:
@@ -441,19 +580,11 @@ class IndexHandler(tornado.web.RequestHandler):
 	            kwargs = {'host':host, 'port':port, 'method':method}, 
 	            id = backup_id, 
 	            name = backup_id, 
-                    #year = cron_year, 
-	            #month = cron_month, 
 	            day = cron_day, 
-	            #week = cron_week, 
-	            #day_of_week = cron_day_of_week, 
-	            #hour = cron_hour, 
-	            #minute = cron_minute, 
-	            #second = cron_second,
 	            start_date = job_start_date, 
 	            end_date = job_end_date, 
 	            replace_existing = True)
                 self.write('''{status:1,job_id:%s,info:"job add success"}'''%(backup_id))
-                #record_backup_plicy_record_sql = '''replace into jd_db_backup_policy(cluster_id,trigger_type,trigger_json,mysql_host,mysql_port,backup_method,start_date,end_date) values("%s","%s","{day:%s,week:%s,day_of_week:%s,hour:%s,minute:%s,second:%s}","%s","%s","%s","%s","%s")'''%(cluster_id,'cron',cron_year,cron_month,cron_day,cron_week,cron_day_of_week,cron_hour,cron_minute,cron_second,host,port,method,job_start_date,job_end_date)
                 record_backup_plicy_record_sql = '''replace into jd_db_backup_policy(job_id,cluster_id,trigger_type,trigger_json,mysql_host,mysql_port,backup_method,start_date,end_date,backup_status) values("%s","%s","%s","{day:\'%s\'}","%s","%s","%s","%s","%s","running")'''%(backup_id,cluster_id,'cron',cron_day,host,port,method,job_start_date,job_end_date)
                 ops_obj._exec_sql(record_backup_plicy_record_sql)
             except Exception, e:
@@ -477,10 +608,9 @@ class IndexHandler(tornado.web.RequestHandler):
 	            kwargs = {'host':host, 'port':port, 'method':method}, 
 	            id = backup_id, 
 	            name = backup_id, 
-	            start_date = job_start_date, 
+	            run_date = job_start_date, 
 	            replace_existing = True)
                 self.write('''{status:1,job_id:%s,info:"job add success"}'''%(backup_id))
-                #record_backup_plicy_record_sql = '''replace into jd_db_backup_policy(cluster_id,trigger_type,trigger_json,mysql_host,mysql_port,backup_method,start_date,end_date) values("%s","%s","{day:%s,week:%s,day_of_week:%s,hour:%s,minute:%s,second:%s}","%s","%s","%s","%s","%s")'''%(cluster_id,'cron',cron_year,cron_month,cron_day,cron_week,cron_day_of_week,cron_hour,cron_minute,cron_second,host,port,method,job_start_date,job_end_date)
                 record_backup_plicy_record_sql = '''replace into jd_db_backup_policy(job_id,cluster_id,trigger_type,trigger_json,mysql_host,mysql_port,backup_method,start_date,end_date,backup_status) values("%s","%s","%s","{date:\'%s\'}","%s","%s","%s","%s","%s","running")'''%(backup_id,cluster_id,'tmp',datetime.datetime.strftime(job_start_date, "%Y-%m-%d %H:%M:%S"),host,port,method,job_start_date,job_start_date)
                 ops_obj._exec_sql(record_backup_plicy_record_sql)
             except Exception, e:
@@ -494,11 +624,6 @@ class IndexHandler(tornado.web.RequestHandler):
                     trigger = 'cron', 
                     id = 'backup_report_monitor', 
                     name = 'backup_report_monitor', 
-                    #year = cron_year, 
-                    #month = cron_month, 
-                    #day = cron_day, 
-                    #week = cron_week, 
-                    #day_of_week = cron_day_of_week, 
                     hour = '%s,%s'%(first_report_time,last_report_time),
                     #hour = '12,13,14,15,16,17',
                     #minute = '*/5', 
@@ -587,11 +712,14 @@ def get_cluster_id(host= None,port = None):
             master_host = slave_status_list[0].get('Master_Host')
             master_port = slave_status_list[0].get('Master_Port')
         else:
-            master_host = None
-            master_port = None
-        get_instance_cluster_id_sql = '''select cluster_id from jd_cluster_details where mysql_ip="%s" and mysql_port = %s'''%(instance_ip,port)
-        cluster_id_list = ops_obj._exec_sql(get_instance_cluster_id_sql)
-        if len(cluster_id_list) > 0:
+            master_host = '1.1.1.1'
+            master_port = 3358
+        try:
+            get_instance_cluster_id_sql = '''select cluster_id from jd_cluster_details where mysql_ip="%s" and mysql_port = %s'''%(instance_ip,port)
+            cluster_id_list = ops_obj._exec_sql(get_instance_cluster_id_sql)
+        except Exception, e:
+            raise e
+        if cluster_id_list:
             cluster_id = '%04d'%(cluster_id_list[0].get('cluster_id'))
         else:
             cluster_id = None
@@ -603,63 +731,77 @@ def get_cluster_id(host= None,port = None):
             else:
                 cluster_id = None
     except Exception, e:
+        print e
         raise e
     finally:
         return cluster_id
-
-#def gen_inventory(host = None):
-#    try:
-#        import os
-#        inventory_file = 'inventory_%s'%(host)
-#        inventory_path = '.ansible_inventory'
-#        ansible_ssh_user = 'root'
-#        ansible_ssh_pass = 'xxxxxxxxxxxxxxx'
-#        inventory_file_path = os.path.join(inventory_path,inventory_file)
-#        os.system('mkdir -p %s'%(inventory_path))
-#        os.system('echo "[initted]">%s'%(inventory_file_path))
-#        os.system('echo "%s">>%s'%(host,inventory_file_path))
-#        inventory = inventory_file_path
-#    except Exception,e:
-#        raise e
-#    finally:
-#        return inventory
-#
 
 class MySQLInstance(object):
     def __init__(self):
         self._host = None
         self._port = None
         self._user = None
-        self._password = None
+        self._pass = None
         self._db = None
+        self._conn = None
         self._cur = None
         self.is_connected = False
-    def _connect_able(self):
-        try:
-            import MySQLdb
-            self._conn = MySQLdb.connect(host=self._host,port=self._port,user=self._user,passwd=self._pass,db=self._db,charset="utf8",connect_timeout=1)
-            self._cur = self._conn.cursor(cursorclass=MySQLdb.cursors.DictCursor)
-            self.is_connected = True
-        except MySQLError,e:
-            self.is_connected = False
-        except Exception,e:
-            print e
-        finally:
-            return self.is_connected
+    #def _connect_able(self):
+    #    try:
+    #        import MySQLdb
+    #        self._conn = MySQLdb.connect(host=self._host,port=self._port,user=self._user,passwd=self._pass,db=self._db,charset="utf8",connect_timeout=1)
+    #        self._cur = self._conn.cursor(cursorclass=MySQLdb.cursors.DictCursor)
+    #        self.is_connected = True
+    #    except MySQLError,e:
+    #        self.is_connected = False
+    #    except Exception,e:
+    #        raise
+    #    finally:
+    #        #if self._cur:
+    #        #    self._cur.close()
+    #        if self._conn:
+    #            self._conn.close()
+    #        return self.is_connected
 
+    #def _exec_sql(self, sql):
+    #    try:
+    #        import MySQLdb
+    #        result_dic = ()
+    #        try:
+    #            print sql
+    #            self._conn = MySQLdb.connect(host=self._host,port=self._port,user=self._user,passwd=self._pass,db=self._db,charset="utf8",connect_timeout=5)
+    #            self._cur = self._conn.cursor(cursorclass=MySQLdb.cursors.DictCursor)
+    #            self._cur.execute(sql)
+    #            #self._conn.commit()
+    #            result_dic = self._cur.fetchall()
+    #        except Exception,e:
+    #            print '%s:%s'%(e,sql)
+    #            raise '_exec_sql:%s'%(e)
+    #    except Exception,e:
+    #        raise e
+    #    finally:
+    #        #if self._cur:
+    #        #    self._cur.close()
+    #        if self._conn:
+    #            self._conn.close()
+    #        return result_dic
     def _exec_sql(self, sql):
         try:
-            if self._connect_able():
-                self._cur.execute(sql)
-                self._conn.commit()
-                result_dic = self._cur.fetchall()
-            else:
-                result_dic = None
+            import MySQLdb
+            data = None
+            print sql
+            db = MySQLdb.connect(host=self._host,port=int(self._port),user=self._user,passwd=self._pass,db=self._db,charset="utf8",connect_timeout=5 )
+            cursor = db.cursor(cursorclass=MySQLdb.cursors.DictCursor)
+            cursor.execute(sql)
+            data = cursor.fetchall()
+            db.commit()
+            db.close()
         except Exception,e:
+            print e
             raise e
         finally:
-            return result_dic
-#print get_cluster_id('10.187.7.120',3358)
+            return data
+
 scheduler = TornadoScheduler(jobstores=jobstores,executors=executors,job_defaults=job_defaults, timezone='Asia/Shanghai')
 ops_obj = MySQLInstance()
 ops_obj._host = mysql_host
@@ -667,6 +809,16 @@ ops_obj._port = mysql_port
 ops_obj._user = mysql_user
 ops_obj._pass = mysql_pass
 ops_obj._db = mysql_db
+dbs_obj = MySQLInstance()
+dbs_obj._host = dbs_host
+dbs_obj._port = dbs_port
+dbs_obj._user = dbs_user
+dbs_obj._pass = dbs_pass
+dbs_obj._db = dbs_db
+#host='10.187.22.222'
+#backup_mysql(host,3358,'xtra')
+#print ops_obj._exec_sql('select 1')
+#retry_backup()
 if __name__ == "__main__":
     tornado.options.parse_command_line()
     app = tornado.web.Application(handlers=[(r"/", IndexHandler)])
