@@ -45,104 +45,112 @@ def gen_inventory(host = None):
 
 def backup_mysql(host=None,port=3358,method='xtra'):
     try:
-        import os
-        import socket
-        import datetime
-        import ansible.runner
-        import datetime
-        import re
-        print 'start backup mysql %s:%s in method:%s'%(host,port,method)
-        ip = socket.gethostbyname(host)
-        pause_replication_delay_monitor(ip)
-        inventory_file = gen_inventory(ip)
-        fail_info = ''
-        backup_script='/usr/local/mysqlha/mysqlha_backup'
-        runner = ansible.runner.Runner(
-           host_list = "%s"%(inventory_file),
-           module_name = 'ping',
-           module_args = '',
-           pattern='initted',
-           #sudo = true,
-           #sudo_user='root',
-           #remote_user='root',
-           #remote_pass='Root_JD.com_0811',
-        )   
-        ping_result = runner.run()
-        if ping_result.get('contacted',{}).get(ip,{}).get('ping','') == 'pong':
-            check_backup_cmd='''ls %s'''%(backup_script)
-            runner = ansible.runner.Runner(
-               host_list = "%s"%(inventory_file),
-               module_name = 'shell',
-               module_args = check_backup_cmd,
-               pattern='initted',
-               #sudo = true,
-               #sudo_user='root',
-               #remote_user='root',
-               #remote_pass='Root_JD.com_0811',
-            )   
-            check_result = runner.run()
-            if check_result.get('contacted',{}).get(ip,{}).get('stdout','') == backup_script:
-                remote_backup_cmd='''sudo nohup python2.6 %s --port=%s --method=%s &'''%(backup_script,port,method)
-                runner = ansible.runner.Runner(
-                   host_list = "%s"%(inventory_file),
-                   module_name = 'shell',
-                   module_args = remote_backup_cmd,
-                   pattern='initted',
-                   #sudo = true,
-                   #sudo_user='root',
-                   #remote_user='root',
-                   #remote_pass='Root_JD.com_0811',
-                 )
-                result = {}
-                try:
-                   result = runner.run()
-                   print result
-                except Exception,e:
-                    raise e
-                #if result.get('contacted',{}).get(ip,{}).get('stdout','')=='':
-                #stdout = result.get('contacted',{}).get(ip,{}).get('stdout','')
-                #stderr = result.get('contacted',{}).get(ip,{}).get('stderr','')
-                #if re.findall(r'compress backup file success',stdout) or re.findall(r'compress backup file success',stderr):
-                #    pass
-                #else:
-                #    fail_info = 'Execute backup command failed'
-            else:
-                fail_info = '''check mysqlha_backup failed'''
-        else:
-            fail_info = '''%s'''%(ping_result.get('dark',{}).get(ip,{}).get('msg','').replace('"',"'")[0:200])
-        if fail_info:
-            cluster_id = get_cluster_id(ip,port)
-            get_latest_continue_fail_counts_sql = '''SELECT continue_fail_counts from jd_db_backup_detail d where cluster_id="%s" order by backup_start_time desc limit 1'''%(cluster_id)
-            latest_continue_fail_counts_result_dic = ops_obj._exec_sql(get_latest_continue_fail_counts_sql)
-            if latest_continue_fail_counts_result_dic and len(latest_continue_fail_counts_result_dic) > 0:
-                latest_continue_fail_counts = latest_continue_fail_counts_result_dic[0].get('continue_fail_counts',0)
-            else:
-                latest_continue_fail_counts = 0
-            get_latest_retry_counts_sql = '''SELECT retry_counts+1 retry_counts from jd_db_backup_detail d where cluster_id="%s" and db_ip=INET_ATON("%s") and backup_start_time >= date_sub(NOW(), INTERVAL "12" HOUR ) and (backup_start_time >= date_sub(NOW(), INTERVAL "10" MINUTE) or backup_end_time >= date_sub(NOW(), INTERVAL "%s*2" MINUTE)) order by backup_start_time desc limit 1'''%(cluster_id,ip,retry_minutes)
-            latest_retry_counts_result = ops_obj._exec_sql(get_latest_retry_counts_sql)
-            if latest_retry_counts_result and len(latest_retry_counts_result)>0:
-                latest_retry_counts = latest_retry_counts_result[0].get('retry_counts',0)
-            else:
-                latest_retry_counts = 0
-            recorde_backup_sql = '''insert into jd_db_backup_detail(cluster_id,db_ip,db_port,db_backup_method,db_type,backup_start_time,backup_status,info,continue_fail_counts,retry_counts) values ("%s",inet_aton("%s"),"%s","%s","mysql",now(),"failed","%s","%s",%s)'''%(cluster_id,ip,port,method,fail_info,latest_continue_fail_counts+1,latest_retry_counts)
-            ops_obj._exec_sql(recorde_backup_sql)
-        #enable_replication_delay_monitor_sql = '''update maintenance set time_stop = DATE_ADD(NOW(), INTERVAL 1 MINUTE),time_operate= DATE_ADD(NOW(), INTERVAL 1 MINUTE) where ip="%s" and type="Replication Delay"'''%(ip)
-        #dbs_obj._exec_sql(enable_replication_delay_monitor_sql)
-    except Exception, e:
+        import urllib2
+        url_str = '''http://127.0.0.1:8081/?opt=mysql_backup&mysql_host=%s&mysql_port=%s&backup_method=%s'''%(host,port,method)
+        print url_str
+        urllib2.urlopen(url_str)
+    except Exception,e:
         raise e
-
-def pause_replication_delay_monitor(host = None):
-    try:
-        maintance_result=[]
-        get_maintance_sql = '''SELECT 1 "maintanced" FROM maintenance m WHERE m.ip = "%s" AND (( m.time_start BETWEEN NOW() AND DATE_ADD(NOW(), INTERVAL 3 HOUR)) OR ( NOW() BETWEEN m.time_start AND m.time_stop )) AND state IN (0, 1)'''%(host)
-        maintance_result = dbs_obj._exec_sql(get_maintance_sql)
-        if len(maintance_result) > 0:
-            pass
-        else:
-           maintain_replication_delay_sql = '''insert into maintenance (ip, server_group, type, reason, operator, time_operate, time_start, time_stop, state) values ("%s", "%s", "Replication Delay", "数据库备份", "数据库备份", now(), now(), DATE_ADD(NOW(), INTERVAL 5 HOUR), 0)'''%(host,"Oracle")
-           dbs_obj._exec_sql(maintain_replication_delay_sql)
-    except Exception, e:
-        raise "pause_replication_delay_monitor:%s"%(e)
+#def backup_mysql(host=None,port=3358,method='xtra'):
+#    try:
+#        import os
+#        import socket
+#        import datetime
+#        import ansible.runner
+#        import datetime
+#        import re
+#        print 'start backup mysql %s:%s in method:%s'%(host,port,method)
+#        ip = socket.gethostbyname(host)
+#        pause_replication_delay_monitor(ip)
+#        inventory_file = gen_inventory(ip)
+#        fail_info = ''
+#        backup_script='/usr/local/mysqlha/mysqlha_backup'
+#        runner = ansible.runner.Runner(
+#           host_list = "%s"%(inventory_file),
+#           module_name = 'ping',
+#           module_args = '',
+#           pattern='initted',
+#           #sudo = true,
+#           #sudo_user='root',
+#           #remote_user='root',
+#           #remote_pass='Root_JD.com_0811',
+#        )   
+#        ping_result = runner.run()
+#        if ping_result.get('contacted',{}).get(ip,{}).get('ping','') == 'pong':
+#            check_backup_cmd='''ls %s'''%(backup_script)
+#            runner = ansible.runner.Runner(
+#               host_list = "%s"%(inventory_file),
+#               module_name = 'shell',
+#               module_args = check_backup_cmd,
+#               pattern='initted',
+#               #sudo = true,
+#               #sudo_user='root',
+#               #remote_user='root',
+#               #remote_pass='Root_JD.com_0811',
+#            )   
+#            check_result = runner.run()
+#            if check_result.get('contacted',{}).get(ip,{}).get('stdout','') == backup_script:
+#                remote_backup_cmd='''sudo nohup python2.6 %s --port=%s --method=%s &'''%(backup_script,port,method)
+#                runner = ansible.runner.Runner(
+#                   host_list = "%s"%(inventory_file),
+#                   module_name = 'shell',
+#                   module_args = remote_backup_cmd,
+#                   pattern='initted',
+#                   #sudo = true,
+#                   #sudo_user='root',
+#                   #remote_user='root',
+#                   #remote_pass='Root_JD.com_0811',
+#                 )
+#                result = {}
+#                try:
+#                   result = runner.run()
+#                   print result
+#                except Exception,e:
+#                    raise e
+#                #if result.get('contacted',{}).get(ip,{}).get('stdout','')=='':
+#                #stdout = result.get('contacted',{}).get(ip,{}).get('stdout','')
+#                #stderr = result.get('contacted',{}).get(ip,{}).get('stderr','')
+#                #if re.findall(r'compress backup file success',stdout) or re.findall(r'compress backup file success',stderr):
+#                #    pass
+#                #else:
+#                #    fail_info = 'Execute backup command failed'
+#            else:
+#                fail_info = '''check mysqlha_backup failed'''
+#        else:
+#            fail_info = '''%s'''%(ping_result.get('dark',{}).get(ip,{}).get('msg','').replace('"',"'")[0:200])
+#        if fail_info:
+#            cluster_id = get_cluster_id(ip,port)
+#            get_latest_continue_fail_counts_sql = '''SELECT continue_fail_counts from jd_db_backup_detail d where cluster_id="%s" order by backup_start_time desc limit 1'''%(cluster_id)
+#            latest_continue_fail_counts_result_dic = ops_obj._exec_sql(get_latest_continue_fail_counts_sql)
+#            if latest_continue_fail_counts_result_dic and len(latest_continue_fail_counts_result_dic) > 0:
+#                latest_continue_fail_counts = latest_continue_fail_counts_result_dic[0].get('continue_fail_counts',0)
+#            else:
+#                latest_continue_fail_counts = 0
+#            get_latest_retry_counts_sql = '''SELECT retry_counts+1 retry_counts from jd_db_backup_detail d where cluster_id="%s" and db_ip=INET_ATON("%s") and backup_start_time >= date_sub(NOW(), INTERVAL "12" HOUR ) and (backup_start_time >= date_sub(NOW(), INTERVAL "10" MINUTE) or backup_end_time >= date_sub(NOW(), INTERVAL "%s*2" MINUTE)) order by backup_start_time desc limit 1'''%(cluster_id,ip,retry_minutes)
+#            latest_retry_counts_result = ops_obj._exec_sql(get_latest_retry_counts_sql)
+#            if latest_retry_counts_result and len(latest_retry_counts_result)>0:
+#                latest_retry_counts = latest_retry_counts_result[0].get('retry_counts',0)
+#            else:
+#                latest_retry_counts = 0
+#            recorde_backup_sql = '''insert into jd_db_backup_detail(cluster_id,db_ip,db_port,db_backup_method,db_type,backup_start_time,backup_status,info,continue_fail_counts,retry_counts) values ("%s",inet_aton("%s"),"%s","%s","mysql",now(),"failed","%s","%s",%s)'''%(cluster_id,ip,port,method,fail_info,latest_continue_fail_counts+1,latest_retry_counts)
+#            ops_obj._exec_sql(recorde_backup_sql)
+#        #enable_replication_delay_monitor_sql = '''update maintenance set time_stop = DATE_ADD(NOW(), INTERVAL 1 MINUTE),time_operate= DATE_ADD(NOW(), INTERVAL 1 MINUTE) where ip="%s" and type="Replication Delay"'''%(ip)
+#        #dbs_obj._exec_sql(enable_replication_delay_monitor_sql)
+#    except Exception, e:
+#        raise e
+#
+#def pause_replication_delay_monitor(host = None):
+#    try:
+#        maintance_result=[]
+#        get_maintance_sql = '''SELECT 1 "maintanced" FROM maintenance m WHERE m.ip = "%s" AND (( m.time_start BETWEEN NOW() AND DATE_ADD(NOW(), INTERVAL 3 HOUR)) OR ( NOW() BETWEEN m.time_start AND m.time_stop )) AND state IN (0, 1)'''%(host)
+#        maintance_result = dbs_obj._exec_sql(get_maintance_sql)
+#        if len(maintance_result) > 0:
+#            pass
+#        else:
+#           maintain_replication_delay_sql = '''insert into maintenance (ip, server_group, type, reason, operator, time_operate, time_start, time_stop, state) values ("%s", "%s", "Replication Delay", "数据库备份", "数据库备份", now(), now(), DATE_ADD(NOW(), INTERVAL 5 HOUR), 0)'''%(host,"Oracle")
+#           dbs_obj._exec_sql(maintain_replication_delay_sql)
+#    except Exception, e:
+#        raise "pause_replication_delay_monitor:%s"%(e)
 
 def get_backup_report():
     try:
